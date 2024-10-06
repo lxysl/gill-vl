@@ -23,7 +23,6 @@ import os
 import random
 import sys
 import time
-import copy
 import warnings
 
 import torch
@@ -463,7 +462,7 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
   model.train()
   end = time.time()
 
-  for i, (_, images, image_grid_thw, caption_images, ret_token_ids, ret_caption_len, gen_token_ids, gen_caption_len, clip_emb) in enumerate(train_loader):
+  for i, (_, images, image_grid_thw, caption_images, ret_token_ids, ret_token_len, gen_token_ids, gen_token_len, labels, clip_emb) in enumerate(train_loader):
     actual_step = epoch * args.steps_per_epoch + i + 1
     # measure data loading time
     data_time.update(time.time() - end)
@@ -471,9 +470,9 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
     if torch.cuda.is_available():
       images = images.cuda(args.gpu, non_blocking=True)
       ret_token_ids = ret_token_ids.cuda(args.gpu, non_blocking=True)
-      ret_caption_len = ret_caption_len.cuda(args.gpu, non_blocking=True)
+      ret_token_len = ret_token_len.cuda(args.gpu, non_blocking=True)
       gen_token_ids = gen_token_ids.cuda(args.gpu, non_blocking=True)
-      gen_caption_len = gen_caption_len.cuda(args.gpu, non_blocking=True)
+      gen_token_len = gen_token_len.cuda(args.gpu, non_blocking=True)
       clip_emb = clip_emb.cuda(args.gpu, non_blocking=True)
 
     if args.precision == 'fp16':
@@ -492,11 +491,11 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       concat_captions = random.uniform(0, 1) < args.concat_captions_prob
 
       if model_mode == 'retrieval':
-        input_ids, labels, token_len = ret_token_ids, copy.deepcopy(ret_token_ids), ret_caption_len
+        input_ids, token_len = ret_token_ids, ret_token_len
       elif model_mode == 'generation':
-        input_ids, labels, token_len = gen_token_ids, copy.deepcopy(gen_token_ids), gen_caption_len
+        input_ids, token_len = gen_token_ids, gen_token_len
       else:
-        input_ids, labels, token_len = ret_token_ids, copy.deepcopy(ret_token_ids), ret_caption_len  # For captioning, it doesn't matter.
+        input_ids, token_len = ret_token_ids, ret_token_len  # For captioning, it doesn't matter.
 
       (model_output, full_labels, last_embedding, _, visual_embs, visual_embs_norm,
         input_embs_norm, _) = model(images, image_grid_thw, input_ids, labels, token_len, mode=model_mode,

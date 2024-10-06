@@ -161,7 +161,7 @@ class GILLModel(nn.Module):
     image_grid_thw: torch.LongTensor,
     input_ids: torch.LongTensor = None,
     labels: Optional[torch.LongTensor] = None,
-    caption_len: Optional[torch.LongTensor] = None,
+    token_len: Optional[torch.LongTensor] = None,
     mode: str = 'captioning',
     concat_captions: bool = False,
     input_prefix: Optional[str] = None,
@@ -175,7 +175,7 @@ class GILLModel(nn.Module):
     input_embs = self.input_embeddings(input_ids)  # (N, T, D)
     input_embs_norm = ((input_embs ** 2).sum(dim=-1) ** 0.5).mean()
 
-    last_embedding_idx = caption_len - 1  # -1 to retrieve the token before the eos token
+    last_embedding_idx = token_len - 1  # -1 to retrieve the token before the eos token
 
     if mode == 'captioning':
       # Just add visual embeddings.
@@ -188,49 +188,18 @@ class GILLModel(nn.Module):
       visual_embs = visual_embs.to(input_embs.device, input_embs.dtype)
       input_embs = input_embs.masked_scatter(visual_mask, visual_embs)
 
-      full_labels = torch.zeros(visual_embs.shape[:2], dtype=torch.int64).to(visual_embs.device) - 100  # TODO: use labels instead of full_labels, mask at correct place
-
-      # Mask out embedding tokens in the labels.
-      full_labels = torch.cat([full_labels, labels], axis=1)
-
-      pad_idx = []
-
-      for label in full_labels:
-        for k, token in enumerate(label):
-          # Mask out retrieval/gen tokens if they exist.
-          if token in [self.tokenizer.pad_token_id] + self.retrieval_token_idx + self.gen_token_idx:
-            label[k:] = -100
-            pad_idx.append(k)
-            break
-          if k == len(label) - 1:  # No padding found.
-            pad_idx.append(k + 1)
-      assert len(pad_idx) == batch_size, (len(pad_idx), batch_size)
-
       output = self.lm(inputs_embeds=input_embs,
-                       labels=full_labels,
+                       labels=labels,
                        output_hidden_states=True)
     elif mode in ['retrieval', 'generation']:
-      full_labels = torch.clone(labels)
-
-      pad_idx = []
-      for label in full_labels:
-        for k, token in enumerate(label):
-          if (token == self.tokenizer.pad_token_id):
-            label[k:] = -100
-            pad_idx.append(k)
-            break
-          if k == len(label) - 1:  # No padding found.
-            pad_idx.append(k + 1)
-      assert len(pad_idx) == batch_size, (len(pad_idx), batch_size)
-
-      # Update labels to pad non-first [IMG{i}] tokens, only reserve [IMG0]
-      for label in full_labels:
-        for k, token in enumerate(label):
-          if (token == self.tokenizer.pad_token_id) or (token in (self.retrieval_token_idx[1:] + self.gen_token_idx[1:])):
-            label[k:] = -100
+      # update label of [IMG0] token from -100 to index of [IMG0].
+      for input_id, label in zip(input_ids, labels):
+        for k, token in enumerate(input_id):
+          if token in [self.retrieval_token_idx[0], self.gen_token_idx[0]]:
+            label[k] = input_id[k]
             break
       output = self.lm(inputs_embeds=input_embs,
-                       labels=full_labels,
+                       labels=labels,
                        output_hidden_states=True)
     else:
       raise NotImplementedError
@@ -274,7 +243,7 @@ class GILLModel(nn.Module):
     else:
       raise NotImplementedError
 
-    return output, full_labels, last_embedding, last_output_logit, visual_embs, visual_embs_norm, input_embs_norm, llm_hidden_states
+    return output, labels, last_embedding, last_output_logit, visual_embs, visual_embs_norm, input_embs_norm, llm_hidden_states
 
   def generate(self, embeddings = torch.FloatTensor, max_len: int = 32,
                temperature: float = 0.0, top_p: float = 1.0, min_word_tokens: int = 0,

@@ -104,8 +104,9 @@ class CsvDataset(Dataset):
     while True:
       image_path = os.path.join(self.base_image_dir, str(self.images[idx]))
       clip_l_path = os.path.join(self.base_image_dir, 'clip_embs', str(self.images[idx]) + '.npy')
+      # caption = "A picture of" + caption + [IMG0]...[IMG7]
       caption = str(self.captions[idx])
-      caption = self.input_prompt + caption  # "A picture of" + caption
+      caption = self.input_prompt + caption
       for i in range(self.num_tokens):
         caption += f'[IMG{i}]'
       messages = [  # just for fitting the format to extract image pixel_values
@@ -147,20 +148,36 @@ class CsvDataset(Dataset):
           truncation=True,  # truncation at right
           return_tensors="pt"
         )
-        tokens = inputs.input_ids[0]
-        caption_len = inputs.attention_mask[0].sum()
+        input_ids = inputs.input_ids[0]
+        input_len = inputs.attention_mask[0].sum()
         images = inputs.pixel_values
         image_grid_thw = inputs.image_grid_thw
 
-        # If IMG tokens are overridden by padding, replace them with the correct token.
-        if tokens[-1] not in [self.tokenizer.pad_token_id, self.gen_token_idx[-1]]:
-          tokens[-self.num_tokens:] = torch.tensor(self.gen_token_idx).to(dtype=tokens.dtype, device=tokens.device)
+        # input_ids: [...<|endoftext|>, <|im_start|>...<|im_start|>assistant\nA picture of caption[IMG0]...[IMG7], <|im_end|>]
+        # labels:    [...         -100, x         ,-100,          x,     -100,x,      ...       x,-100, ..., -100, x         ]
+        # ignore_index at: <|endoftext|>, system prompt, user prompt, assistant\n, [IMG0]...[IMG7]
+        # supervised_index at: <|im_start|>, <|im_end|>, A picture of caption
 
-        decode_caption = self.tokenizer.decode(tokens, skip_special_tokens=False)
+        labels = self.tokenizer.encode(caption, add_special_tokens=False, return_tensors="pt")[0]
+        labels[-8:] = -100
+        labels = torch.cat([labels, torch.LongTensor([self.tokenizer.eos_token_id])])
+        prefix_labels = input_ids[:-len(labels)].clone()
+        for k, token in enumerate(prefix_labels):
+          if token not in self.tokenizer.encode("<|im_start|><|im_end|>"):
+            prefix_labels[k] = -100
+        labels = torch.cat([prefix_labels, labels])
+
+        # If IMG tokens are truncated, replace them with the correct token.
+        # Qwen2-VL uses left padding, so the last token will always be eos when input length is less than max_len.
+        if input_ids[-1] != self.tokenizer.eos_token_id:
+          input_ids[-self.num_tokens-1:-1] = torch.tensor(self.gen_token_idx).to(dtype=input_ids.dtype, device=input_ids.device)
+          input_ids[-1] = self.tokenizer.eos_token_id
+
+        decode_caption = self.tokenizer.decode(input_ids, skip_special_tokens=False)
         self.font = self.font or ImageFont.load_default()
         cap_img = utils.create_image_of_text(decode_caption.encode('ascii', 'ignore'), width=self.image_size, nrows=2, font=self.font)
 
-        return image_path, images, image_grid_thw, cap_img, tokens, caption_len, tokens, caption_len, clip_emb
+        return image_path, images, image_grid_thw, cap_img, input_ids, input_len, input_ids, input_len, labels, clip_emb
       except Exception as e:
         print(f'Error reading for {image_path} with caption {caption}: {e}')
         # Pick a new example at random.
