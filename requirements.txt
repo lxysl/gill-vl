@@ -1,5 +1,5 @@
 absl-py==1.4.0
-accelerate==0.20.3
+accelerate
 attrs==22.2.0
 cachetools==5.3.1
 certifi==2022.12.7
@@ -50,14 +50,14 @@ tensorboard-data-server==0.7.0
 tensorboard-plugin-wit==1.8.1
 tokenizers==0.12.1
 tomli==2.0.1
-torch==1.13.1
-torchaudio==0.11.0
+torch==2.4.0
+torchaudio==2.4.0
 torchmetrics==0.11.4
-torchvision==0.12.0
+torchvision==0.19.1
 tqdm==4.64.1
-transformers==4.30.2
+transformers
 typing_extensions==4.4.0
 urllib3==1.26.14
-git+https://github.com/ildoonet/pytorch-gradual-warmup-lr.git
 Werkzeug==2.3.6
 zipp==3.15.0
+jinja2
