@@ -39,7 +39,7 @@ import torch.utils.data.distributed
 import torchvision.datasets as datasets
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 
 from gill import data
 from gill import losses as losses_utils
@@ -48,19 +48,18 @@ from gill import utils
 from gill import validate
 
 
-llm_models = ['facebook/opt-125m', 'facebook/opt-350m', 'facebook/opt-1.3b', 'facebook/opt-2.7b',
-              'facebook/opt-6.7b', 'facebook/opt-13b', 'facebook/opt-30b', 'facebook/opt-66b']
+vlm_models = ['Qwen/Qwen2-VL-2B-Instruct', 'Qwen/Qwen2-VL-7B-Instruct', 'Qwen/Qwen2-VL-72B-Instruct']
 datasets = ['cc3m']
 best_acc1 = 0  # Variable to keep track of best model so far.
 
 
 def parse_args(args):
   parser = argparse.ArgumentParser(description='GILL training')
-  parser.add_argument('--opt-version', default='facebook/opt-6.7b',
-                      choices=llm_models,
-                      help='OPT versions: ' +
-                        ' | '.join(llm_models) +
-                        ' (default: "facebook/opt-6.7b")')
+  parser.add_argument('--vlm-version', default='Qwen/Qwen2-VL-2B-Instruct',
+                      choices=vlm_models,
+                      help='VLM versions: ' +
+                        ' | '.join(vlm_models) +
+                        ' (default: "Qwen/Qwen2-VL-2B-Instruct")')
   parser.add_argument('--visual-model', default='openai/clip-vit-large-patch14', type=str,
                       help="Visual encoder to use.")
   parser.add_argument('--num-tokens', default=8, type=int, metavar='N', help='Number of [IMG] tokens to use.')
@@ -124,6 +123,9 @@ def parse_args(args):
   parser.add_argument('--image-size', default=224, type=int, metavar='N', help='Size of images.')
   parser.add_argument('--ret-emb-dim', default=256, type=int, metavar='N', help='Embedding dimension for retrieval.')
   parser.add_argument('--gen-emb-dim', default=768, type=int, metavar='N', help='Embedding dimension for generation.')
+
+  parser.add_argument('--min-pixels', default=4*28*28, type=int, metavar='N*28*28', help='Minimum number of pixels for a valid image.')
+  parser.add_argument('--max-pixels', default=32*28*28, type=int, metavar='N*28*28', help='Maximum number of pixels for a valid image.')
   
   text_fc_modes = ['linear', 'gill_mapper']
   parser.add_argument('--text-fc-mode', default='gill_mapper',
@@ -238,7 +240,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
   # Create model
   model_args = models.GILLArgs()
-  model_args.opt_version = args.opt_version
+  model_args.vlm_version = args.vlm_version
   model_args.visual_encoder = args.visual_model
   model_args.text_emb_layers = [-1]
   model_args.freeze_lm = True
@@ -252,15 +254,16 @@ def main_worker(gpu, ngpus_per_node, args):
   model_args.num_clip_tokens = args.num_clip_tokens
   assert args.num_tokens == 0 or 'gill_mapper' in model_args.text_fc_mode or (args.num_tokens * args.gen_emb_dim == args.num_clip_tokens * 768 or args.num_tokens * args.gen_emb_dim == args.num_clip_tokens * 1024), (f'{args.num_tokens} * {args.gen_emb_dim} != {args.num_clip_tokens} * 768 (or 1024)')
 
-  tokenizer = AutoTokenizer.from_pretrained(args.opt_version, use_fast=False)
-  if tokenizer.pad_token is None:
-    if args.opt_version in ['EleutherAI/gpt-j-6B']:
-      tokenizer.pad_token = tokenizer.eos_token
-    else:
-      tokenizer.pad_token_id = tokenizer.eos_token_id
-    print("tokenizer.pad_token, tokenizer.eos_token:", tokenizer.pad_token, tokenizer.eos_token)
-  # Add an image token for loss masking (and visualization) purposes.
-  tokenizer.add_special_tokens({"cls_token": "<|image|>"})  # add special image token to tokenizer
+  processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct", min_pixels=args.min_pixels, max_pixels=args.max_pixels)
+  tokenizer = processor.tokenizer
+  # if tokenizer.pad_token is None:
+  #   if args.opt_version in ['EleutherAI/gpt-j-6B']:
+  #     tokenizer.pad_token = tokenizer.eos_token
+  #   else:
+  #     tokenizer.pad_token_id = tokenizer.eos_token_id
+  #   print("tokenizer.pad_token, tokenizer.eos_token:", tokenizer.pad_token, tokenizer.eos_token)
+  # # Add an image token for loss masking (and visualization) purposes.
+  # tokenizer.add_special_tokens({"cls_token": "<|image|>"})  # add special image token to tokenizer
 
   # Add [IMG] tokens to the vocabulary.
   model_args.retrieval_token_idx = []
@@ -459,7 +462,7 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
   model.train()
   end = time.time()
 
-  for i, (_, images, caption_images, ret_tokens, ret_caption_len, gen_tokens, gen_caption_len, clip_emb) in enumerate(train_loader):
+  for i, (_, images, image_grid_thw, caption_images, ret_tokens, ret_caption_len, gen_tokens, gen_caption_len, clip_emb) in enumerate(train_loader):
     actual_step = epoch * args.steps_per_epoch + i + 1
     # measure data loading time
     data_time.update(time.time() - end)
@@ -495,7 +498,7 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
         tgt_tokens, token_len = ret_tokens, ret_caption_len  # For captioning, it doesn't matter.
 
       (model_output, full_labels, last_embedding, _, visual_embs, visual_embs_norm,
-        input_embs_norm, _) = model(images, tgt_tokens, token_len, mode=model_mode,
+        input_embs_norm, _) = model(images, image_grid_thw, tgt_tokens, token_len, mode=model_mode,
                                  concat_captions=concat_captions)
       output = model_output.logits
 

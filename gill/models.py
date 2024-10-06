@@ -13,7 +13,7 @@ import pickle as pkl
 from PIL import Image, UnidentifiedImageError
 from requests.exceptions import ConnectionError
 
-from transformers import AutoTokenizer, AutoModel, CLIPVisionModel, OPTForCausalLM
+from transformers import AutoTokenizer, AutoModel, CLIPVisionModel, Qwen2VLForConditionalGeneration
 from gill import utils
 from gill import layers
 
@@ -21,8 +21,8 @@ from gill import layers
 class GILLArgs:
   freeze_lm: bool = True
   freeze_vm: bool = True
-  opt_version: str = 'facebook/opt-6.7b'
-  visual_encoder: str = 'openai/clip-vit-large-patch14'
+  vlm_version: str = 'Qwen/Qwen2-VL-2B-Instruct'
+  # visual_encoder: str = 'openai/clip-vit-large-patch14'
   n_visual_tokens: int = 1
   task: str = 'captioning'
   ret_emb_dim: Optional[int] = 256
@@ -37,28 +37,33 @@ class GILLArgs:
 
 
 class GILLModel(nn.Module):
-  def __init__(self, tokenizer, args: GILLArgs = GILLArgs()):
+  def __init__(self, processor, args: GILLArgs = GILLArgs()):
     super().__init__()
-    self.tokenizer = tokenizer
-    self.feature_extractor = utils.get_feature_extractor_for_model(args.visual_encoder, train=False)
+    self.processor = processor
+    self.tokenizer = processor.tokenizer
+    # self.feature_extractor = utils.get_feature_extractor_for_model(args.visual_encoder, train=False)
     self.image_token = self.tokenizer.cls_token_id
     assert args.text_emb_layers != set(args.text_emb_layers), 'text_emb_layers not unique'
     self.args = args
     self.num_tokens = args.num_tokens
     self.num_clip_tokens = args.num_clip_tokens
 
-    opt_version = args.opt_version
-    visual_encoder = args.visual_encoder
+    vlm_version = args.vlm_version
     n_visual_tokens = args.n_visual_tokens
-    print(f"Using {opt_version} for the language model.")
-    print(f"Using {visual_encoder} for the visual model with {n_visual_tokens} visual tokens.")
+    print(f"Using {vlm_version} for the language model with {n_visual_tokens} visual tokens.")
 
-    if 'facebook/opt' in opt_version:
-      self.lm = OPTForCausalLM.from_pretrained(opt_version)
+    print("Restoring pretrained weights for the vision language model.")
+    if 'qwen2' in vlm_version:
+      self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
+        vlm_version, torch_dtype="auto", device_map="auto"
+      )
+      self.lm = self.vlm.model
+      self.visual_model = self.vlm.visual
+      embed_dim = self.visual_model.config.embed_dim
     else:
       raise NotImplementedError
 
-    self.opt_version = opt_version
+    self.vlm_version = vlm_version
 
     if self.args.freeze_lm:
       self.lm.eval()
@@ -70,20 +75,9 @@ class GILLModel(nn.Module):
 
     self.retrieval_token_idx = args.retrieval_token_idx
     self.gen_token_idx = args.gen_token_idx
-    self.lm.resize_token_embeddings(len(tokenizer))
+    self.lm.resize_token_embeddings(len(self.tokenizer))
 
     self.input_embeddings = self.lm.get_input_embeddings()
-
-    print("Restoring pretrained weights for the visual model.")
-    if 'clip' in visual_encoder:
-      self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder)
-    else:
-      self.visual_model = AutoModel.from_pretrained(visual_encoder)
-
-    if 'clip' in visual_encoder:
-      hidden_size = self.visual_model.config.hidden_size
-    else:
-      raise NotImplementedError
 
     if self.args.freeze_vm:
       print("Freezing the VM.")
@@ -93,16 +87,13 @@ class GILLModel(nn.Module):
     else:
       self.visual_model.train()
 
-    self.visual_model_name = visual_encoder
-
-    embedding_dim = self.input_embeddings.embedding_dim * self.args.n_visual_tokens
     self.ret_text_hidden_fcs = nn.ModuleList([])
     self.gen_text_hidden_fcs = nn.ModuleList([])
 
     for layer_idx in self.args.text_emb_layers:
-      if (layer_idx == -1 or layer_idx == self.lm.config.num_hidden_layers) and ('bert' not in opt_version):
-        if 'opt' in opt_version:  # OPT models
-          in_dim = self.lm.config.word_embed_proj_dim
+      if (layer_idx == -1 or layer_idx == self.lm.config.num_hidden_layers):
+        if 'qwen2' in self.vlm_version:  # Qwen2 models
+          in_dim = self.lm.config.hidden_size
         else:
           raise NotImplementedError
 
@@ -114,35 +105,37 @@ class GILLModel(nn.Module):
                              num_output_tokens=self.args.num_clip_tokens, mode=self.args.text_fc_mode))
 
       elif layer_idx < self.lm.config.num_hidden_layers:
-        self.ret_text_hidden_fcs.append(layers.TextFcLayer(self.lm.config.hidden_size, self.args.ret_emb_dim, num_input_tokens=self.args.num_tokens, num_output_tokens=1, mode=self.args.ret_text_fc_mode))
-        self.gen_text_hidden_fcs.append(layers.TextFcLayer(self.lm.config.hidden_size, self.args.gen_emb_dim, num_input_tokens=self.args.num_tokens, num_output_tokens=self.args.num_clip_tokens, mode=self.args.text_fc_mode))
+        self.ret_text_hidden_fcs.append(
+          layers.TextFcLayer(self.lm.config.hidden_size, self.args.ret_emb_dim, num_input_tokens=self.args.num_tokens,
+                             num_output_tokens=1, mode=self.args.ret_text_fc_mode))
+        self.gen_text_hidden_fcs.append(
+          layers.TextFcLayer(self.lm.config.hidden_size, self.args.gen_emb_dim, num_input_tokens=self.args.num_tokens,
+                             num_output_tokens=self.args.num_clip_tokens, mode=self.args.text_fc_mode))
       else:
         raise ValueError(f'Embedding of layer {layer_idx} was requested but model only has {self.lm.config.num_hidden_layers} layers.')
 
-    self.visual_embeddings = nn.Linear(hidden_size, embedding_dim)
+    # self.visual_embeddings = nn.Linear(hidden_size, embedding_dim)
 
     # Retrieval image FC layer.
-    self.visual_fc = nn.Linear(hidden_size, self.args.ret_emb_dim)
+    self.visual_fc = nn.Linear(embed_dim, self.args.ret_emb_dim)
     self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
 
-  def get_visual_embs(self, pixel_values: torch.FloatTensor, mode: str = 'captioning'):
+  def get_visual_embs(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor, mode: str = 'captioning'):
     if mode not in ['captioning', 'retrieval', 'generation']:
       raise ValueError(f"mode should be one of ['captioning', 'retrieval', 'generation'], got {mode} instead.")
 
     # Extract visual embeddings from the vision encoder.
-    if 'clip' in self.visual_model_name:
-      outputs = self.visual_model(pixel_values)
-      encoder_outputs = outputs.pooler_output
+    if 'qwen2' in self.vlm_version:
+      image_embeds, image_features = self.visual_model(pixel_values, grid_thw=image_grid_thw)  # image_embeds: text dim, image_features: visual dim
     else:
       raise NotImplementedError
 
     # Use the correct fc based on function argument.
     if mode == 'captioning':
-      visual_embs = self.visual_embeddings(encoder_outputs)  # (2, D * n_visual_tokens)
-      visual_embs = torch.reshape(visual_embs, (visual_embs.shape[0], self.args.n_visual_tokens, -1))
+      visual_embs = image_embeds
     elif mode == 'retrieval':
-      visual_embs = self.visual_fc(encoder_outputs)  # (2, D * n_visual_tokens)
+      visual_embs = self.visual_fc(image_features[:, 0, :])  # (2, D * n_visual_tokens)
       visual_embs = torch.reshape(visual_embs, (visual_embs.shape[0], 1, -1))
     elif mode == 'generation':
       visual_embs = torch.zeros((pixel_values.shape[0], 1, 768), device=pixel_values.device)
@@ -164,13 +157,14 @@ class GILLModel(nn.Module):
   def forward(
     self,
     pixel_values: torch.FloatTensor,
+    image_grid_thw: torch.LongTensor,
     labels: Optional[torch.LongTensor] = None,
     caption_len: Optional[torch.LongTensor] = None,
     mode: str = 'captioning',
     concat_captions: bool = False,
     input_prefix: Optional[str] = None,
   ):
-    visual_embs = self.get_visual_embs(pixel_values, mode)
+    visual_embs = self.get_visual_embs(pixel_values, image_grid_thw, mode)
 
     batch_size, vis_seq_len, _ = visual_embs.shape  # vis_seq_len = n_visual_tokens
     if labels is not None:
@@ -182,33 +176,15 @@ class GILLModel(nn.Module):
 
     last_embedding_idx = caption_len - 1  # -1 to retrieve the token before the eos token
 
-    if input_prefix is not None:
-      prompt_ids = self.tokenizer(input_prefix, add_special_tokens=False, return_tensors="pt").input_ids
-      prompt_ids = prompt_ids.to(visual_embs.device)
-      prompt_embs = self.input_embeddings(prompt_ids)
-      prompt_embs = prompt_embs.repeat(batch_size, 1, 1)
-      assert prompt_embs.shape[0] == batch_size, prompt_embs.shape
-      assert prompt_embs.shape[2] == input_embs.shape[2], prompt_embs.shape
-      assert len(prompt_embs.shape) == 3, prompt_embs.shape
-
     if mode == 'captioning':
       # Concat to text embeddings.
       condition_seq_len = 0
-      if input_prefix is None:
-        # Just add visual embeddings.
-        input_embs = torch.cat([visual_embs, input_embs], axis=1)
-        last_embedding_idx += vis_seq_len
-        condition_seq_len += vis_seq_len
-        full_labels = torch.zeros(visual_embs.shape[:2], dtype=torch.int64).to(visual_embs.device) - 100
-      else:
-        print(f'Adding prefix "{input_prefix}" to captioning.')
-        # Add visual and prompt embeddings.
-        prefix_embs = torch.cat([visual_embs, prompt_embs], axis=1)
-        input_embs = torch.cat([prefix_embs, input_embs], axis=1)
 
-        last_embedding_idx += prefix_embs.shape[1]
-        condition_seq_len += prefix_embs.shape[1]
-        full_labels = torch.zeros(prefix_embs.shape[:2], dtype=torch.int64).to(visual_embs.device) - 100
+      # Just add visual embeddings.  TODO: use qwen2-vl forward method
+      input_embs = torch.cat([visual_embs, input_embs], axis=1)
+      last_embedding_idx += vis_seq_len
+      condition_seq_len += vis_seq_len
+      full_labels = torch.zeros(visual_embs.shape[:2], dtype=torch.int64).to(visual_embs.device) - 100
 
       # Mask out embedding tokens in the labels.
       full_labels = torch.cat([full_labels, labels], axis=1)
@@ -226,66 +202,12 @@ class GILLModel(nn.Module):
             pad_idx.append(k + 1)
       assert len(pad_idx) == batch_size, (len(pad_idx), batch_size)
 
-      bs, seq_len, embs_dim = input_embs.shape
-      if concat_captions:
-        print('Concatenating examples for captioning!')
-        assert len(input_embs.shape) == 3, input_embs
-        assert len(full_labels.shape) == 2, full_labels
-        assert batch_size % 2 == 0
-        all_concat_input_embs = []
-        all_concat_labels = []
-
-        # Rearrange embeddings and labels (and their padding) to concatenate captions.
-        for i in range(batch_size // 2):
-          first_idx = i * 2
-          second_idx = first_idx + 1
-          first_emb = input_embs[first_idx, :pad_idx[first_idx], :]
-          first_labels = full_labels[first_idx, :pad_idx[first_idx]]
-          first_padding = input_embs[first_idx, pad_idx[first_idx]:, :]
-          first_labels_padding = full_labels[first_idx, pad_idx[first_idx]:]
-
-          second_emb = input_embs[second_idx, :pad_idx[second_idx], :]
-          second_labels = full_labels[second_idx, :pad_idx[second_idx]]
-          second_padding = input_embs[second_idx, pad_idx[second_idx]:, :]
-          second_labels_padding = full_labels[second_idx, pad_idx[second_idx]:]
-          bos_idx = visual_embs.shape[1]
-
-          assert torch.all(first_labels_padding == -100), first_labels_padding
-          assert torch.all(second_labels_padding == -100), second_labels_padding
-          assert torch.all(second_labels[bos_idx] == self.tokenizer.bos_token_id), (second_labels, bos_idx, self.tokenizer.bos_token_id)
-          
-          # Remove BOS token of the second caption.
-          second_labels = torch.cat([second_labels[:bos_idx], second_labels[bos_idx + 1:]], axis=0)
-          second_emb = torch.cat([second_emb[:bos_idx, :], second_emb[bos_idx + 1:, :]], axis=0)
-
-          concat_input_embs = torch.cat([first_emb, second_emb, first_padding, second_padding], axis=0)   # (T*2, 768)
-          concat_labels = torch.cat([first_labels, second_labels, first_labels_padding, second_labels_padding], axis=0)   # (T*2, 768)
-          all_concat_input_embs.append(concat_input_embs)
-          all_concat_labels.append(concat_labels)
-
-        # Pad to max length.
-        input_embs = torch.stack(all_concat_input_embs, axis=0)  # (N/2, T*2, 768)
-        full_labels = torch.stack(all_concat_labels, axis=0)  # (N/2, T*2, 768)
-        print("Concatenated full_labels:", full_labels[0, ...])
-        assert input_embs.shape == (bs // 2, seq_len * 2 - 1, embs_dim), input_embs.shape
-        assert full_labels.shape == (bs // 2, seq_len * 2 - 1), full_labels.shape
-
       output = self.lm(inputs_embeds=input_embs,
                        labels=full_labels,
                        output_hidden_states=True)
     elif mode in ['retrieval', 'generation']:
       full_labels = torch.clone(labels)
-      if input_prefix is not None:
-        print(f'Adding prefix "{input_prefix}" to retrieval.')
-        # Add prompt embeddings.
-        prefix_embs = prompt_embs
-        input_embs = torch.cat([prefix_embs, input_embs], axis=1)
-        last_embedding_idx += prefix_embs.shape[1]
-        full_labels = torch.cat([
-          torch.zeros(prefix_embs.shape[:2], dtype=torch.int64).to(labels.device) - 100,
-          full_labels
-        ], axis=1)
-      
+
       pad_idx = []
       for label in full_labels:
         for k, token in enumerate(label):
@@ -297,64 +219,7 @@ class GILLModel(nn.Module):
             pad_idx.append(k + 1)
       assert len(pad_idx) == batch_size, (len(pad_idx), batch_size)
 
-      bs, seq_len, embs_dim = input_embs.shape
-      # Concatenate examples for captioning, if specified.
-      if concat_captions:
-        print(f'Concatenating examples for {mode}!')
-        assert len(input_embs.shape) == 3, input_embs
-        assert len(full_labels.shape) == 2, full_labels
-        assert batch_size % 2 == 0
-        all_concat_input_embs = []
-        all_concat_labels = []
-        all_last_embedding_idx = []
-
-        # Rearrange embeddings and labels (and their padding) to concatenate captions.
-        for i in range(batch_size // 2):
-          first_idx = i * 2
-          second_idx = first_idx + 1
-          first_emb = input_embs[first_idx, :pad_idx[first_idx], :]
-          first_labels = full_labels[first_idx, :pad_idx[first_idx]]
-          first_padding = input_embs[first_idx, pad_idx[first_idx]:, :]
-          first_labels_padding = full_labels[first_idx, pad_idx[first_idx]:]
-
-          second_emb = input_embs[second_idx, :pad_idx[second_idx], :]
-          second_labels = full_labels[second_idx, :pad_idx[second_idx]]
-          second_padding = input_embs[second_idx, pad_idx[second_idx]:, :]
-          second_labels_padding = full_labels[second_idx, pad_idx[second_idx]:]
-
-          bos_idx = 0
-          assert torch.all(first_labels_padding == -100), first_labels_padding
-          assert torch.all(second_labels_padding == -100), second_labels_padding
-          assert torch.all(second_labels[bos_idx] == self.tokenizer.bos_token_id), (second_labels, bos_idx, self.tokenizer.bos_token_id)
-          
-          # Remove BOS token of second caption.
-          second_labels = second_labels[bos_idx + 1:]
-          second_emb = second_emb[bos_idx + 1:, :]
-          last_embedding_idx[second_idx] = last_embedding_idx[second_idx] - 1
-
-          concat_input_embs = torch.cat([first_emb, second_emb, first_padding, second_padding], axis=0)   # (T*2, 768)
-          concat_labels = torch.cat([first_labels, second_labels, first_labels_padding, second_labels_padding], axis=0)   # (T*2, 768)
-          all_concat_input_embs.append(concat_input_embs)
-          all_concat_labels.append(concat_labels)
-
-          all_last_embedding_idx.append((last_embedding_idx[first_idx], first_emb.shape[0] + last_embedding_idx[second_idx]))
-
-          if mode == 'retrieval':
-            assert concat_labels[all_last_embedding_idx[-1][0]] in self.retrieval_token_idx, (concat_labels, all_last_embedding_idx[-1][0])
-            assert concat_labels[all_last_embedding_idx[-1][1]] in self.retrieval_token_idx, (concat_labels, all_last_embedding_idx[-1][1])
-          elif mode == 'generation':
-            # Check that the last n tokens are GEN tokens.
-            for gen_i in range(len(self.gen_token_idx)):
-              assert concat_labels[all_last_embedding_idx[-1][0]-gen_i] == self.gen_token_idx[-gen_i-1], (concat_labels, all_last_embedding_idx[-1][0]-gen_i, self.gen_token_idx[-gen_i-1])
-              assert concat_labels[all_last_embedding_idx[-1][1]-gen_i] == self.gen_token_idx[-gen_i-1], (concat_labels, all_last_embedding_idx[-1][1]-gen_i, self.gen_token_idx[-gen_i-1])
-
-        # Pad to max length.
-        input_embs = torch.stack(all_concat_input_embs, axis=0)  # (N/2, T*2, 768)
-        full_labels = torch.stack(all_concat_labels, axis=0)  # (N/2, T*2, 768)
-        assert input_embs.shape == (bs // 2, seq_len * 2 - 1, embs_dim), input_embs.shape
-        assert full_labels.shape == (bs // 2, seq_len * 2 - 1), full_labels.shape
-
-      # Update labels to pad non-first tokens.
+      # Update labels to pad non-first [IMG{i}] tokens, only reserve [IMG0]
       for label in full_labels:
         for k, token in enumerate(label):
           if (token == self.tokenizer.pad_token_id) or (token in (self.retrieval_token_idx[1:] + self.gen_token_idx[1:])):
@@ -378,48 +243,15 @@ class GILLModel(nn.Module):
       else:
         text_hidden_fcs = self.gen_text_hidden_fcs
 
-      # Concatenate captions for retrieval / generation, if specified.
-      if not concat_captions:
-        for idx, fc_layer in zip(self.args.text_emb_layers, text_hidden_fcs):
-          input_hidden_state = torch.stack([output.hidden_states[idx][i, last_embedding_idx[i]-num_tokens+1:last_embedding_idx[i]+1, :] for i in range(batch_size)], axis=0)
-          input_embedding = torch.stack([input_embs[i, last_embedding_idx[i]-num_tokens+1:last_embedding_idx[i]+1, :] for i in range(batch_size)], axis=0)
-          llm_hidden_states.append(input_hidden_state)
-          hidden_states.append(fc_layer(input_hidden_state, input_embedding))  # (N, seq_len, 2048)
-      else:
-        for idx, fc_layer in zip(self.args.text_emb_layers, text_hidden_fcs):
-          all_last_embedding = []
-          all_input_embedding = []
-          all_last_output_logit = []
-          for i in range(batch_size // 2):
-            first_last_embedding_idx, second_last_embedding_idx = all_last_embedding_idx[i]
-            first_last_embedding = output.hidden_states[idx][i, first_last_embedding_idx-num_tokens+1:first_last_embedding_idx+1, :]  # (N, D)
-            second_last_embedding = output.hidden_states[idx][i, second_last_embedding_idx-num_tokens+1:second_last_embedding_idx+1, :]  # (N, D)
-            all_last_embedding.append(first_last_embedding)
-            all_last_embedding.append(second_last_embedding)
+      for idx, fc_layer in zip(self.args.text_emb_layers, text_hidden_fcs):
+        input_hidden_state = torch.stack([output.hidden_states[idx][i, last_embedding_idx[i]-num_tokens+1:last_embedding_idx[i]+1, :] for i in range(batch_size)], axis=0)
+        input_embedding = torch.stack([input_embs[i, last_embedding_idx[i]-num_tokens+1:last_embedding_idx[i]+1, :] for i in range(batch_size)], axis=0)
+        llm_hidden_states.append(input_hidden_state)
+        hidden_states.append(fc_layer(input_hidden_state, input_embedding))  # (N, seq_len, 2048)
 
-            first_input_embs = input_embs[i, first_last_embedding_idx-num_tokens+1:first_last_embedding_idx+1, :]  # (N, D)
-            second_input_embs = input_embs[i, second_last_embedding_idx-num_tokens+1:second_last_embedding_idx+1, :]  # (N, D)
-            all_input_embedding.append(first_input_embs)
-            all_input_embedding.append(second_input_embs)
-
-            first_last_output_logit = output.logits[i, first_last_embedding_idx - 1, :]  # (N, D)
-            second_last_output_logit = output.logits[i, second_last_embedding_idx - 1, :]  # (N, D)
-            all_last_output_logit.append(first_last_output_logit)
-            all_last_output_logit.append(second_last_output_logit)
-
-          last_embedding = torch.stack(all_last_embedding, axis=0)
-          input_embedding = torch.stack(all_input_embedding, axis=0)
-          last_output_logit = torch.stack(all_last_output_logit, axis=0)
-          llm_hidden_states.append(last_embedding)
-          hidden_states.append(fc_layer(last_embedding, input_embedding))  # (N, seq_len, 2048)
-
-      if not concat_captions:
-        # Add hidden states together.
-        last_embedding = torch.stack(hidden_states, dim=-1).sum(dim=-1) #torch.stack([last_hidden_state[i, :, :] for i in range(batch_size)], axis=0)  # (N, T, D)
-        last_output_logit = torch.stack([output.logits[i, last_embedding_idx[i] - 1, :] for i in range(batch_size)], axis=0)  # (N, D)
-      else:
-        # Add hidden states together.
-        last_embedding = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+      # Add hidden states together.
+      last_embedding = torch.stack(hidden_states, dim=-1).sum(dim=-1) #torch.stack([last_hidden_state[i, :, :] for i in range(batch_size)], axis=0)  # (N, T, D)
+      last_output_logit = torch.stack([output.logits[i, last_embedding_idx[i] - 1, :] for i in range(batch_size)], axis=0)  # (N, D)
 
       # Compute retrieval loss.
       if mode == 'retrieval':
