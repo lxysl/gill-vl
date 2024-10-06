@@ -56,13 +56,13 @@ def get_dataset(args, split: str, processor, tokenizer, precision: str = 'fp32')
       CsvDataset(path, image_dir, processor, 'image',
         'caption', args.visual_model, tokenizer, train=train, max_len=args.max_len, precision=args.precision,
         image_size=args.image_size, retrieval_token_idx=args.retrieval_token_idx, gen_token_idx=args.gen_token_idx, 
-        num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens)
+        num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens, input_prompt=args.input_prompt)
       for (path, image_dir) in zip(dataset_paths, image_data_dirs)])
   elif len(dataset_paths) == 1:
     dataset = CsvDataset(dataset_paths[0], image_data_dirs[0], processor, 'image',
       'caption', args.visual_model, tokenizer, train=train, max_len=args.max_len, precision=args.precision,
       image_size=args.image_size, retrieval_token_idx=args.retrieval_token_idx, gen_token_idx=args.gen_token_idx, 
-      num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens)
+      num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens, input_prompt=args.input_prompt)
   else:
     raise ValueError(f'There should be at least one valid dataset, got train={args.dataset}, val={args.val_dataset} instead.')
   return dataset
@@ -71,9 +71,9 @@ def get_dataset(args, split: str, processor, tokenizer, precision: str = 'fp32')
 class CsvDataset(Dataset):
   def __init__(self, input_filename, base_image_dir, processor, img_key,
                caption_key, feature_extractor_model: str=None, tokenizer=None,
-               train: bool = True, max_len: int = 32, sep="\t", precision: str = 'fp32',
+               train: bool = True, max_len: int = 200, sep="\t", precision: str = 'fp32',
                image_size: int = 224, retrieval_token_idx: List[int] = [-1], gen_token_idx: List[int] = [-1],
-               num_tokens: int = 1, num_clip_tokens: int = 1):
+               num_tokens: int = 1, num_clip_tokens: int = 1, input_prompt: str = ""):
     logging.debug(f'Loading tsv data from {input_filename}.')
     df = pd.read_csv(input_filename, sep=sep)
 
@@ -103,25 +103,34 @@ class CsvDataset(Dataset):
   def __getitem__(self, idx):
     while True:
       image_path = os.path.join(self.base_image_dir, str(self.images[idx]))
-      caption = str(self.captions[idx])
       clip_l_path = os.path.join(self.base_image_dir, 'clip_embs', str(self.images[idx]) + '.npy')
+      caption = str(self.captions[idx])
+      caption = self.input_prompt + caption  # "A picture of" + caption
+      for i in range(self.num_tokens):
+        caption += f'[IMG{i}]'
       messages = [  # just for fitting the format to extract image pixel_values
         {
-          "role": "user",
-          "content": [
-            {
-              "type": "image",
-              "image": image_path,
-            },
-            {
-              "type": "text",
-              "text": caption,
-            }
-          ]
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": image_path,
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": caption,
+                }
+            ]
         }
       ]
 
       try:
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         image_inputs, _ = process_vision_info(messages)
 
         # Only load if we are in generation mode.
@@ -129,14 +138,8 @@ class CsvDataset(Dataset):
           clip_emb = np.load(f, allow_pickle=True)   # (num_clip_tokens, 768)
           clip_emb = clip_emb[:self.num_clip_tokens, :]
 
-        # Generation mode.
-        caption = caption
-        caption = "<|im_start|>assistant\n<|vision_start|><|image_pad|><|vision_end|>" + caption
-        for i in range(self.num_tokens):
-          caption += f'[IMG{i}]'
-        # caption += "<|im_end|>"  # gill does not append eos token to the end of [IMG] tokens.
         inputs = self.processor(
-          text=[caption],
+          text=text,
           images=image_inputs,
           videos=None,
           padding="max_length",  # caution: left padding
