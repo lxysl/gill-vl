@@ -127,6 +127,7 @@ class GILLModel(nn.Module):
 
     # Extract visual embeddings from the vision encoder.
     if 'qwen2' in self.vlm_version:
+      pixel_values = pixel_values.type(self.visual_model.get_dtype())
       image_embeds, image_features = self.visual_model(pixel_values, grid_thw=image_grid_thw)  # image_embeds: text dim, image_features: visual dim
     else:
       raise NotImplementedError
@@ -158,6 +159,7 @@ class GILLModel(nn.Module):
     self,
     pixel_values: torch.FloatTensor,
     image_grid_thw: torch.LongTensor,
+    input_ids: torch.LongTensor = None,
     labels: Optional[torch.LongTensor] = None,
     caption_len: Optional[torch.LongTensor] = None,
     mode: str = 'captioning',
@@ -167,24 +169,26 @@ class GILLModel(nn.Module):
     visual_embs = self.get_visual_embs(pixel_values, image_grid_thw, mode)
 
     batch_size, vis_seq_len, _ = visual_embs.shape  # vis_seq_len = n_visual_tokens
-    if labels is not None:
-      assert labels.shape[0] == batch_size, (visual_embs.shape, labels.shape)
+    assert input_ids.shape[0] == batch_size, (input_ids.shape, visual_embs.shape)
     visual_embs_norm = ((visual_embs ** 2).sum(dim=-1) ** 0.5).mean()
 
-    input_embs = self.input_embeddings(labels)  # (N, T, D)
+    input_embs = self.input_embeddings(input_ids)  # (N, T, D)
     input_embs_norm = ((input_embs ** 2).sum(dim=-1) ** 0.5).mean()
 
     last_embedding_idx = caption_len - 1  # -1 to retrieve the token before the eos token
 
     if mode == 'captioning':
-      # Concat to text embeddings.
-      condition_seq_len = 0
+      # Just add visual embeddings.
+      visual_mask = (
+        (input_ids == self.vlm.image_token_id)
+        .unsqueeze(-1)
+        .expand_as(input_embs)
+        .to(input_embs.device)
+      )
+      visual_embs = visual_embs.to(input_embs.device, input_embs.dtype)
+      input_embs = input_embs.masked_scatter(visual_mask, visual_embs)
 
-      # Just add visual embeddings.  TODO: use qwen2-vl forward method
-      input_embs = torch.cat([visual_embs, input_embs], axis=1)
-      last_embedding_idx += vis_seq_len
-      condition_seq_len += vis_seq_len
-      full_labels = torch.zeros(visual_embs.shape[:2], dtype=torch.int64).to(visual_embs.device) - 100
+      full_labels = torch.zeros(visual_embs.shape[:2], dtype=torch.int64).to(visual_embs.device) - 100  # TODO: use labels instead of full_labels, mask at correct place
 
       # Mask out embedding tokens in the labels.
       full_labels = torch.cat([full_labels, labels], axis=1)

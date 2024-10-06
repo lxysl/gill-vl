@@ -139,7 +139,9 @@ class CsvDataset(Dataset):
           text=[caption],
           images=image_inputs,
           videos=None,
-          padding=True,
+          padding="max_length",  # caution: left padding
+          max_length=self.max_len,
+          truncation=True,  # truncation at right
           return_tensors="pt"
         )
         tokens = inputs.input_ids[0]
