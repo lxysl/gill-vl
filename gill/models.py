@@ -53,7 +53,7 @@ class GILLModel(nn.Module):
     print(f"Using {vlm_version} for the language model with {n_visual_tokens} visual tokens.")
 
     print("Restoring pretrained weights for the vision language model.")
-    if 'qwen2' in vlm_version:
+    if 'Qwen2' in vlm_version:
       self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
         vlm_version, torch_dtype="auto", device_map="auto"
       )
@@ -92,7 +92,7 @@ class GILLModel(nn.Module):
 
     for layer_idx in self.args.text_emb_layers:
       if (layer_idx == -1 or layer_idx == self.lm.config.num_hidden_layers):
-        if 'qwen2' in self.vlm_version:  # Qwen2 models
+        if 'Qwen2' in self.vlm_version:  # Qwen2 models
           in_dim = self.lm.config.hidden_size
         else:
           raise NotImplementedError
@@ -126,7 +126,7 @@ class GILLModel(nn.Module):
       raise ValueError(f"mode should be one of ['captioning', 'retrieval', 'generation'], got {mode} instead.")
 
     # Extract visual embeddings from the vision encoder.
-    if 'qwen2' in self.vlm_version:
+    if 'Qwen2' in self.vlm_version:
       pixel_values = pixel_values.type(self.visual_model.get_dtype())
       image_embeds, image_features = self.visual_model(pixel_values, grid_thw=image_grid_thw)  # image_embeds: text dim, image_features: visual dim
     else:
@@ -161,10 +161,9 @@ class GILLModel(nn.Module):
     image_grid_thw: torch.LongTensor,
     input_ids: torch.LongTensor = None,
     labels: Optional[torch.LongTensor] = None,
-    token_len: Optional[torch.LongTensor] = None,
+    caption_start_id: Optional[torch.LongTensor] = None,
+    caption_end_id: Optional[torch.LongTensor] = None,
     mode: str = 'captioning',
-    concat_captions: bool = False,
-    input_prefix: Optional[str] = None,
   ):
     visual_embs = self.get_visual_embs(pixel_values, image_grid_thw, mode)
 
@@ -174,8 +173,6 @@ class GILLModel(nn.Module):
 
     input_embs = self.input_embeddings(input_ids)  # (N, T, D)
     input_embs_norm = ((input_embs ** 2).sum(dim=-1) ** 0.5).mean()
-
-    last_embedding_idx = token_len - 1  # -1 to retrieve the token before the eos token
 
     if mode == 'captioning':
       # Just add visual embeddings.
@@ -210,21 +207,20 @@ class GILLModel(nn.Module):
     llm_hidden_states = []
 
     if mode in ['retrieval', 'generation']:
-      num_tokens = self.num_tokens
       if mode == 'retrieval':
         text_hidden_fcs = self.ret_text_hidden_fcs
       else:
         text_hidden_fcs = self.gen_text_hidden_fcs
 
       for idx, fc_layer in zip(self.args.text_emb_layers, text_hidden_fcs):
-        input_hidden_state = torch.stack([output.hidden_states[idx][i, last_embedding_idx[i]-num_tokens+1:last_embedding_idx[i]+1, :] for i in range(batch_size)], axis=0)
-        input_embedding = torch.stack([input_embs[i, last_embedding_idx[i]-num_tokens+1:last_embedding_idx[i]+1, :] for i in range(batch_size)], axis=0)
+        input_hidden_state = torch.stack([output.hidden_states[idx][i, caption_end_id[i]:caption_end_id[i]+self.num_tokens, :] for i in range(batch_size)], axis=0)
+        input_embedding = torch.stack([input_embs[i, caption_end_id[i]:caption_end_id[i]+self.num_tokens, :] for i in range(batch_size)], axis=0)
         llm_hidden_states.append(input_hidden_state)
         hidden_states.append(fc_layer(input_hidden_state, input_embedding))  # (N, seq_len, 2048)
 
       # Add hidden states together.
       last_embedding = torch.stack(hidden_states, dim=-1).sum(dim=-1) #torch.stack([last_hidden_state[i, :, :] for i in range(batch_size)], axis=0)  # (N, T, D)
-      last_output_logit = torch.stack([output.logits[i, last_embedding_idx[i] - 1, :] for i in range(batch_size)], axis=0)  # (N, D)
+      last_output_logit = torch.stack([output.logits[i, -1, :] for i in range(batch_size)], axis=0)  # (N, D)
 
       # Compute retrieval loss.
       if mode == 'retrieval':
@@ -338,11 +334,11 @@ class GILLModel(nn.Module):
 
 
 class GILL(nn.Module):
-  def __init__(self, tokenizer, model_args: Optional[GILLArgs] = None,
+  def __init__(self, processor, model_args: Optional[GILLArgs] = None,
                path_array: Optional[List[str]] = None, emb_matrix: Optional[torch.tensor] = None,
                load_sd: bool = False, num_gen_images: int = 1, decision_model_path: Optional[str] = None):
     super().__init__()
-    self.model = GILLModel(tokenizer, model_args)
+    self.model = GILLModel(processor, model_args)
     self.path_array = path_array
     self.emb_matrix = emb_matrix
     self.load_sd = load_sd
@@ -365,11 +361,11 @@ class GILL(nn.Module):
       self.decision_model.load_state_dict(mlp_checkpoint['state_dict'], strict=True)
       self.decision_model.eval()
 
-  def __call__(self, images: Tensor, tgt_tokens: Optional[Tensor] = None, caption_len: Optional[Tensor] = None,
+  def __call__(self, images: Tensor, image_grid_ths: Tensor, input_ids: Optional[Tensor] = None, labels: Optional[Tensor] = None,
+               caption_start_id: Optional[Tensor] = None, caption_end_id: Optional[Tensor] = None,
                generate: bool = False, num_words: int = 32, temperature: float = 1.0, top_p: float = 1.0,
                ret_scale_factor: float = 1.0, gen_scale_factor: float = 1.0,
-               min_word_tokens: int = 0, mode: str = 'captioning', concat_captions: bool = False,
-               input_prefix: Optional[str] = None) -> Tensor:
+               min_word_tokens: int = 0, mode: str = 'captioning') -> Tensor:
     if generate:
       return self.model.generate(images, num_words, temperature=temperature, top_p=top_p,
                                  min_word_tokens=min_word_tokens, ret_scale_factor=ret_scale_factor,
@@ -377,11 +373,12 @@ class GILL(nn.Module):
     else:
       output = self.model(
         pixel_values = images,
-        labels = tgt_tokens,
-        caption_len = caption_len,
-        mode = mode,
-        concat_captions = concat_captions,
-        input_prefix = input_prefix)
+        image_grid_ths = image_grid_ths,
+        input_ids = input_ids,
+        labels = labels,
+        caption_start_id = caption_start_id,
+        caption_end_id = caption_end_id,
+        mode = mode)
       return output
 
   def generate_for_images_and_texts(

@@ -92,6 +92,7 @@ class CsvDataset(Dataset):
     self.gen_token_idx = gen_token_idx
     self.num_tokens = num_tokens
     self.num_clip_tokens = num_clip_tokens
+    self.input_prompt = input_prompt
 
     self.font = None
 
@@ -131,16 +132,30 @@ class CsvDataset(Dataset):
       ]
 
       try:
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        image_inputs, _ = process_vision_info(messages)
+        # --- mode == 'captioning' ---
+        # input_ids: [...<|endoftext|>, <|im_start|>...<|im_start|>assistant\nA picture of caption[IMG0]...[IMG7], <|im_end|>]
+        # labels:    [...         -100, x         ,-100,          x,     -100,x,      ...       x,-100, ..., -100, x         ]
+        # ignore_index at: <|endoftext|>, system prompt, user prompt, assistant\n, [IMG0]...[IMG7]
+        # supervised_index at: <|im_start|>, <|im_end|>, A picture of caption
+
+        # --- mode in ['retrival', 'generation'] ---
+        # input_ids: [...<|endoftext|>, A picture of caption[IMG0]...[IMG7]]
+        # labels:    [...         -100, x,      ...       x,-100, ..., -100]
+        # ignore_index at: <|endoftext|>, [IMG0]...[IMG7]
+        # supervised_index at: A picture of caption
 
         # Only load if we are in generation mode.
         with open(clip_l_path, 'rb') as f:
           clip_emb = np.load(f, allow_pickle=True)   # (num_clip_tokens, 768)
           clip_emb = clip_emb[:self.num_clip_tokens, :]
 
+        labels = self.tokenizer.encode(caption, add_special_tokens=False, return_tensors="pt")[0]
+        labels[-self.num_tokens:] = -100
+
+        captioning_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        image_inputs, _ = process_vision_info(messages)
         inputs = self.processor(
-          text=text,
+          text=captioning_text,
           images=image_inputs,
           videos=None,
           padding="max_length",  # caution: left padding
@@ -148,36 +163,47 @@ class CsvDataset(Dataset):
           truncation=True,  # truncation at right
           return_tensors="pt"
         )
-        input_ids = inputs.input_ids[0]
-        input_len = inputs.attention_mask[0].sum()
+        captioning_input_ids = inputs.input_ids[0]
+        captioning_start_id = self.max_len - len(labels) - 1  # [-> A picture of ...]
+        captioning_end_id = self.max_len - self.num_tokens - 1  # [... A picture of caption[IMG0] <-]
         images = inputs.pixel_values
         image_grid_thw = inputs.image_grid_thw
 
-        # input_ids: [...<|endoftext|>, <|im_start|>...<|im_start|>assistant\nA picture of caption[IMG0]...[IMG7], <|im_end|>]
-        # labels:    [...         -100, x         ,-100,          x,     -100,x,      ...       x,-100, ..., -100, x         ]
-        # ignore_index at: <|endoftext|>, system prompt, user prompt, assistant\n, [IMG0]...[IMG7]
-        # supervised_index at: <|im_start|>, <|im_end|>, A picture of caption
-
-        labels = self.tokenizer.encode(caption, add_special_tokens=False, return_tensors="pt")[0]
-        labels[-8:] = -100
-        labels = torch.cat([labels, torch.LongTensor([self.tokenizer.eos_token_id])])
-        prefix_labels = input_ids[:-len(labels)].clone()
+        captioning_labels = torch.cat([labels, torch.LongTensor([self.tokenizer.eos_token_id], device=labels.device)])
+        prefix_labels = captioning_input_ids[:-len(captioning_labels)].clone()
         for k, token in enumerate(prefix_labels):
           if token not in self.tokenizer.encode("<|im_start|><|im_end|>"):
             prefix_labels[k] = -100
-        labels = torch.cat([prefix_labels, labels])
+        captioning_labels = torch.cat([prefix_labels, captioning_labels])
+
+        gen_input_ids = self.tokenizer.encode(
+          caption,
+          padding="max_length",  # caution: left padding
+          max_length=self.max_len,
+          truncation=True,  # truncation at right
+          add_special_tokens=False,
+          return_tensors="pt"
+        )[0]
+        gen_start_id = self.max_len - len(labels)  # [-> A picture of ...]
+        gen_end_id = self.max_len - self.num_tokens  # [... A picture of caption[IMG0] <-]
+        gen_labels = torch.cat([torch.full((self.max_len - len(labels),), -100, dtype=torch.long, device=labels.device), labels])
 
         # If IMG tokens are truncated, replace them with the correct token.
         # Qwen2-VL uses left padding, so the last token will always be eos when input length is less than max_len.
-        if input_ids[-1] != self.tokenizer.eos_token_id:
-          input_ids[-self.num_tokens-1:-1] = torch.tensor(self.gen_token_idx).to(dtype=input_ids.dtype, device=input_ids.device)
-          input_ids[-1] = self.tokenizer.eos_token_id
+        if captioning_input_ids[-1] != self.tokenizer.eos_token_id:
+          captioning_input_ids[-self.num_tokens-1:-1] = torch.tensor(self.gen_token_idx).to(dtype=captioning_input_ids.dtype, device=captioning_input_ids.device)
+          captioning_input_ids[-1] = self.tokenizer.eos_token_id
+          captioning_labels[-self.num_tokens-1:-1] = -100
+          captioning_labels[-1] = self.tokenizer.eos_token_id
+        if gen_input_ids[-1] not in self.gen_token_idx:
+          gen_input_ids[-self.num_tokens-1:-1] = torch.tensor(self.gen_token_idx).to(dtype=gen_input_ids.dtype, device=gen_input_ids.device)
+          gen_labels[-self.num_tokens-1:-1] = -100
 
-        decode_caption = self.tokenizer.decode(input_ids, skip_special_tokens=False)
+        decode_caption = self.tokenizer.decode(labels[:-self.num_tokens], skip_special_tokens=False)
         self.font = self.font or ImageFont.load_default()
         cap_img = utils.create_image_of_text(decode_caption.encode('ascii', 'ignore'), width=self.image_size, nrows=2, font=self.font)
 
-        return image_path, images, image_grid_thw, cap_img, input_ids, input_len, input_ids, input_len, labels, clip_emb
+        return image_path, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb
       except Exception as e:
         print(f'Error reading for {image_path} with caption {caption}: {e}')
         # Pick a new example at random.

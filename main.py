@@ -60,8 +60,6 @@ def parse_args(args):
                       help='VLM versions: ' +
                         ' | '.join(vlm_models) +
                         ' (default: "Qwen/Qwen2-VL-2B-Instruct")')
-  parser.add_argument('--visual-model', default='openai/clip-vit-large-patch14', type=str,
-                      help="Visual encoder to use.")
   parser.add_argument('--num-tokens', default=8, type=int, metavar='N', help='Number of [IMG] tokens to use.')
   parser.add_argument('--num-clip-tokens', default=77, type=int, metavar='N', help='Number of CLIP token to use for generation.')
 
@@ -241,7 +239,6 @@ def main_worker(gpu, ngpus_per_node, args):
   # Create model
   model_args = models.GILLArgs()
   model_args.vlm_version = args.vlm_version
-  model_args.visual_encoder = args.visual_model
   model_args.text_emb_layers = [-1]
   model_args.freeze_lm = True
   model_args.freeze_vm = True
@@ -286,7 +283,7 @@ def main_worker(gpu, ngpus_per_node, args):
   with open(os.path.join(args.log_dir, 'model_args.json'), 'w') as f:
     json.dump(vars(model_args), f, indent=4)
 
-  model = models.GILL(tokenizer, model_args)
+  model = models.GILL(processor, model_args)
   if args.precision == 'fp16':
     model = model.float()
   elif args.precision == 'bf16':
@@ -372,8 +369,8 @@ def main_worker(gpu, ngpus_per_node, args):
   cudnn.benchmark = True
 
   # Data loading code
-  train_dataset = data.get_dataset(args, 'train', tokenizer)
-  val_dataset = data.get_dataset(args, 'val', tokenizer)
+  train_dataset = data.get_dataset(args, 'train', processor, tokenizer)
+  val_dataset = data.get_dataset(args, 'val', processor, tokenizer)
   print(f'Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples.')
 
   if args.distributed:
@@ -462,17 +459,17 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
   model.train()
   end = time.time()
 
-  for i, (_, images, image_grid_thw, caption_images, ret_token_ids, ret_token_len, gen_token_ids, gen_token_len, labels, clip_emb) in enumerate(train_loader):
+  for i, (_, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb) in enumerate(train_loader):
     actual_step = epoch * args.steps_per_epoch + i + 1
     # measure data loading time
     data_time.update(time.time() - end)
 
     if torch.cuda.is_available():
       images = images.cuda(args.gpu, non_blocking=True)
-      ret_token_ids = ret_token_ids.cuda(args.gpu, non_blocking=True)
-      ret_token_len = ret_token_len.cuda(args.gpu, non_blocking=True)
+      cap_token_ids = cap_token_ids.cuda(args.gpu, non_blocking=True)
+      cap_labels = cap_labels.cuda(args.gpu, non_blocking=True)
       gen_token_ids = gen_token_ids.cuda(args.gpu, non_blocking=True)
-      gen_token_len = gen_token_len.cuda(args.gpu, non_blocking=True)
+      gen_labels = gen_labels.cuda(args.gpu, non_blocking=True)
       clip_emb = clip_emb.cuda(args.gpu, non_blocking=True)
 
     if args.precision == 'fp16':
@@ -488,18 +485,16 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       print('Running', model_mode)
       mode_start = time.time()
       # compute output
-      concat_captions = random.uniform(0, 1) < args.concat_captions_prob
 
       if model_mode == 'retrieval':
-        input_ids, token_len = ret_token_ids, ret_token_len
+        input_ids, labels, caption_start_id, caption_end_id = cap_token_ids, cap_labels, cap_start_id, cap_end_id
       elif model_mode == 'generation':
-        input_ids, token_len = gen_token_ids, gen_token_len
+        input_ids, labels, caption_start_id, caption_end_id = gen_token_ids, gen_labels, gen_start_id, gen_end_id
       else:
-        input_ids, token_len = ret_token_ids, ret_token_len  # For captioning, it doesn't matter.
+        input_ids, labels, caption_start_id, caption_end_id = gen_token_ids, gen_labels, gen_start_id, gen_end_id  # For captioning, it doesn't matter.
 
       (model_output, full_labels, last_embedding, _, visual_embs, visual_embs_norm,
-        input_embs_norm, _) = model(images, image_grid_thw, input_ids, labels, token_len, mode=model_mode,
-                                 concat_captions=concat_captions)
+        input_embs_norm, _) = model(images, image_grid_thw, input_ids, labels, caption_start_id, caption_end_id, mode=model_mode)
       output = model_output.logits
 
       # Measure captioning accuracy for multi-task models and next-token prediction for retrieval models.
@@ -683,7 +678,8 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
         max_images_to_show = 16
 
         # Append caption text.
-        pred_tokens = output[:, args.n_visual_tokens-1:-1, :].argmax(dim=-1)
+        min_start_id = torch.min(caption_start_id)
+        pred_tokens = output[:, min_start_id:-1-args.num_tokens, :].argmax(dim=-1)
         generated_captions = tokenizer.batch_decode(pred_tokens, skip_special_tokens=False)
 
         if model_mode == 'captioning':
