@@ -132,18 +132,6 @@ class CsvDataset(Dataset):
       ]
 
       try:
-        # --- mode == 'captioning' ---
-        # input_ids: [...<|endoftext|>, <|im_start|>...<|im_start|>assistant\nA picture of caption[IMG0]...[IMG7], <|im_end|>]
-        # labels:    [...         -100, x         ,-100,          x,     -100,x,      ...       x,-100, ..., -100, x         ]
-        # ignore_index at: <|endoftext|>, system prompt, user prompt, assistant\n, [IMG0]...[IMG7]
-        # supervised_index at: <|im_start|>, <|im_end|>, A picture of caption
-
-        # --- mode in ['retrival', 'generation'] ---
-        # input_ids: [...<|endoftext|>, A picture of caption[IMG0]...[IMG7]]
-        # labels:    [...         -100, x,      ...       x,-100, ..., -100]
-        # ignore_index at: <|endoftext|>, [IMG0]...[IMG7]
-        # supervised_index at: A picture of caption
-
         # Only load if we are in generation mode.
         with open(clip_l_path, 'rb') as f:
           clip_emb = np.load(f, allow_pickle=True)   # (num_clip_tokens, 768)
@@ -151,43 +139,66 @@ class CsvDataset(Dataset):
 
         labels = self.tokenizer.encode(caption, add_special_tokens=False, return_tensors="pt")[0]
         labels[-self.num_tokens:] = -100
-
         captioning_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+
         image_inputs, _ = process_vision_info(messages)
-        inputs = self.processor(
-          text=captioning_text,
-          images=image_inputs,
-          videos=None,
-          padding="max_length",  # caution: left padding
-          max_length=self.max_len,
-          truncation=True,  # truncation at right
-          return_tensors="pt"
-        )
-        captioning_input_ids = inputs.input_ids[0]
-        captioning_start_id = self.max_len - len(labels) - 1  # [-> A picture of ...]
-        captioning_end_id = self.max_len - self.num_tokens - 1  # [... A picture of caption[IMG0] <-]
-        images = inputs.pixel_values
-        image_grid_thw = inputs.image_grid_thw
+        image_inputs = self.processor.image_processor(images=image_inputs, videos=None)
+        images = image_inputs["pixel_values"]
+        image_grid_thw = image_inputs["image_grid_thw"]
 
-        captioning_labels = torch.cat([labels, torch.LongTensor([self.tokenizer.eos_token_id], device=labels.device)])
-        prefix_labels = captioning_input_ids[:-len(captioning_labels)].clone()
-        for k, token in enumerate(prefix_labels):
-          if token not in self.tokenizer.encode("<|im_start|><|im_end|>"):
-            prefix_labels[k] = -100
-        captioning_labels = torch.cat([prefix_labels, captioning_labels])
+        # --- mode == 'captioning' ---
+        # input_ids: [<|im_start|>...<|im_start|>assistant\nA picture of caption[IMG0]...[IMG7], <|im_end|>, <|endoftext|>...]
+        # labels:    [x         ,-100,          x,     -100,x,      ...       x,-100, ..., -100, x         , -100         ...]
+        # ignore_index at: <|endoftext|>, system prompt, user prompt, assistant\n, [IMG0]...[IMG7]
+        # supervised_index at: <|im_start|>, <|im_end|>, A picture of caption
 
-        gen_input_ids = self.tokenizer.encode(
-          caption,
-          padding="max_length",  # caution: left padding
+        # --- mode in ['retrival', 'generation'] ---
+        # input_ids: [A picture of caption[IMG0]...[IMG7], <|endoftext|>...]
+        # labels:    [x,      ...       x,-100, ..., -100, -100         ...]
+        # ignore_index at: <|endoftext|>, [IMG0]...[IMG7]
+        # supervised_index at: A picture of caption
+
+        merge_length = self.processor.merge_size**2
+        index = 0
+        for i in range(len(captioning_text)):
+          while "<|image_pad|>" in captioning_text:
+            captioning_text = captioning_text.replace(
+              "<|image_pad|>", "<|placeholder|>" * (image_grid_thw[index].prod() // merge_length), 1
+            )
+            index += 1
+          captioning_text = captioning_text.replace("<|place_holder|>", "<|image_pad|>")
+        captioning_input_ids = self.tokenizer.encode(
+          captioning_text,
+          padding_side="right",
+          padding="max_length",
           max_length=self.max_len,
-          truncation=True,  # truncation at right
+          truncation=True,
           add_special_tokens=False,
           return_tensors="pt"
         )[0]
-        gen_start_id = self.max_len - len(labels)  # [-> A picture of ...]
-        gen_end_id = self.max_len - self.num_tokens  # [... A picture of caption[IMG0] <-]
-        gen_labels = torch.cat([torch.full((self.max_len - len(labels),), -100, dtype=torch.long, device=labels.device), labels])
+        no_pad_captioning_ids = self.tokenizer.encode(captioning_text)[0]
+        captioning_start_id = len(no_pad_captioning_ids) - len(labels) - 1  # [-> A picture of ...]
+        captioning_end_id = len(no_pad_captioning_ids) - self.num_tokens - 1  # [... A picture of caption[IMG0] <-]
 
+        prefix_labels = captioning_input_ids[:captioning_start_id].clone()
+        for k, token in enumerate(prefix_labels):
+          if token not in self.tokenizer.encode("<|im_start|><|im_end|>"):
+            prefix_labels[k] = -100
+        captioning_labels = torch.cat([prefix_labels, labels, torch.full((self.max_len - len(prefix_labels) - len(labels),), -100, dtype=torch.long, device=labels.device)])
+
+        gen_input_ids = self.tokenizer.encode(
+          caption,
+          padding_side="right",
+          padding="max_length",
+          max_length=self.max_len,
+          truncation=True,
+          add_special_tokens=False,
+          return_tensors="pt"
+        )[0]
+        gen_start_id = 0  # [-> A picture of ...]
+        gen_end_id = len(labels) - self.num_tokens  # [... A picture of caption[IMG0] <-]
+        gen_labels = torch.cat([labels, torch.full((self.max_len - len(labels),), -100, dtype=torch.long, device=labels.device)])
+        
         # If IMG tokens are truncated, replace them with the correct token.
         # Qwen2-VL uses left padding, so the last token will always be eos when input length is less than max_len.
         if captioning_input_ids[-1] != self.tokenizer.eos_token_id:

@@ -487,11 +487,11 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       # compute output
 
       if model_mode == 'retrieval':
-        input_ids, labels, caption_start_id, caption_end_id = cap_token_ids, cap_labels, cap_start_id, cap_end_id
+        input_ids, labels, caption_start_id, caption_end_id = gen_token_ids, gen_labels, gen_start_id, gen_end_id
       elif model_mode == 'generation':
         input_ids, labels, caption_start_id, caption_end_id = gen_token_ids, gen_labels, gen_start_id, gen_end_id
       else:
-        input_ids, labels, caption_start_id, caption_end_id = gen_token_ids, gen_labels, gen_start_id, gen_end_id  # For captioning, it doesn't matter.
+        input_ids, labels, caption_start_id, caption_end_id = cap_token_ids, cap_labels, cap_start_id, cap_end_id  # For captioning, it doesn't matter.
 
       (model_output, full_labels, last_embedding, _, visual_embs, visual_embs_norm,
         input_embs_norm, _) = model(images, image_grid_thw, input_ids, labels, caption_start_id, caption_end_id, mode=model_mode)
