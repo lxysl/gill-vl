@@ -13,7 +13,8 @@ import pickle as pkl
 from PIL import Image, UnidentifiedImageError
 from requests.exceptions import ConnectionError
 
-from transformers import AutoTokenizer, AutoModel, CLIPVisionModel, Qwen2VLForConditionalGeneration
+from transformers import AutoTokenizer, AutoModel, CLIPVisionModel
+from gill.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLCausalLMOutputWithPast
 from gill import utils
 from gill import layers
 
@@ -34,6 +35,7 @@ class GILLArgs:
   ret_text_fc_mode: str = 'linear'
   num_tokens: int = 8
   num_clip_tokens: int = 77
+  precision: str = 'fp32'
 
 
 class GILLModel(nn.Module):
@@ -52,10 +54,19 @@ class GILLModel(nn.Module):
     n_visual_tokens = args.n_visual_tokens
     print(f"Using {vlm_version} for the language model with {n_visual_tokens} visual tokens.")
 
+    if args.precision == 'fp16':
+      precision = torch.float16
+    elif args.precision == 'bf16':
+      precision = torch.bfloat16
+    elif args.precision == 'fp32':
+      precision = torch.float32
+    else:
+      raise ValueError(f"Precision should be one of ['fp16', 'bf16', 'fp32'], got {args.precision} instead.")
+
     print("Restoring pretrained weights for the vision language model.")
     if 'Qwen2' in vlm_version:
       self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
-        vlm_version, torch_dtype="auto", device_map="auto"
+        vlm_version, torch_dtype=precision, device_map="auto"
       )
       self.lm = self.vlm.model
       self.visual_model = self.vlm.visual
@@ -118,7 +129,9 @@ class GILLModel(nn.Module):
 
     # Retrieval image FC layer.
     self.visual_fc = nn.Linear(embed_dim, self.args.ret_emb_dim)
+    # self.visual_fc = self.visual_fc.bfloat16()
     self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+    # self.logit_scale = self.logit_scale.bfloat16()
 
 
   def get_visual_embs(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor, mode: str = 'captioning'):
@@ -128,7 +141,10 @@ class GILLModel(nn.Module):
     # Extract visual embeddings from the vision encoder.
     if 'Qwen2' in self.vlm_version:
       pixel_values = pixel_values.type(self.visual_model.get_dtype())
+      bs, num_tokens, _ = pixel_values.shape
+      pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])  # (N * num_tokens, D)
       image_embeds, image_features = self.visual_model(pixel_values, grid_thw=image_grid_thw)  # image_embeds: text dim, image_features: visual dim
+      image_features = image_features.reshape(bs, num_tokens, -1)
     else:
       raise NotImplementedError
 
@@ -165,10 +181,9 @@ class GILLModel(nn.Module):
     caption_end_id: Optional[torch.LongTensor] = None,
     mode: str = 'captioning',
   ):
+    batch_size = input_ids.shape[0]
+    
     visual_embs = self.get_visual_embs(pixel_values, image_grid_thw, mode)
-
-    batch_size, vis_seq_len, _ = visual_embs.shape  # vis_seq_len = n_visual_tokens
-    assert input_ids.shape[0] == batch_size, (input_ids.shape, visual_embs.shape)
     visual_embs_norm = ((visual_embs ** 2).sum(dim=-1) ** 0.5).mean()
 
     input_embs = self.input_embeddings(input_ids)  # (N, T, D)
@@ -177,7 +192,7 @@ class GILLModel(nn.Module):
     if mode == 'captioning':
       # Just add visual embeddings.
       visual_mask = (
-        (input_ids == self.vlm.image_token_id)
+        (input_ids == self.vlm.config.image_token_id)
         .unsqueeze(-1)
         .expand_as(input_embs)
         .to(input_embs.device)
@@ -185,8 +200,8 @@ class GILLModel(nn.Module):
       visual_embs = visual_embs.to(input_embs.device, input_embs.dtype)
       input_embs = input_embs.masked_scatter(visual_mask, visual_embs)
 
-      output = self.lm(inputs_embeds=input_embs,
-                       labels=labels,
+      output = self.lm(input_ids=None,
+                       inputs_embeds=input_embs,
                        output_hidden_states=True)
     elif mode in ['retrieval', 'generation']:
       # update label of [IMG0] token from -100 to index of [IMG0].
@@ -195,11 +210,33 @@ class GILLModel(nn.Module):
           if token in [self.retrieval_token_idx[0], self.gen_token_idx[0]]:
             label[k] = input_id[k]
             break
-      output = self.lm(inputs_embeds=input_embs,
-                       labels=labels,
+      output = self.lm(input_ids=None,
+                       inputs_embeds=input_embs,
                        output_hidden_states=True)
     else:
       raise NotImplementedError
+
+    last_hidden_state = output.last_hidden_state
+    hidden_states = output.hidden_states
+    logits = self.vlm.lm_head(last_hidden_state)
+    logits = logits.float()
+
+    # Shift so that tokens < n predict n
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    # Flatten the tokens
+    loss_fct = nn.CrossEntropyLoss()
+    shift_logits = shift_logits.view(-1, self.vlm.config.vocab_size)
+    shift_labels = shift_labels.view(-1)
+    # Enable model parallelism
+    shift_labels = shift_labels.to(shift_logits.device)
+    loss = loss_fct(shift_logits, shift_labels)
+
+    output = Qwen2VLCausalLMOutputWithPast(
+      loss=loss,
+      logits=logits,
+      hidden_states=hidden_states,
+    )
 
     last_embedding = None
     last_output_logit = None
@@ -268,7 +305,11 @@ class GILLModel(nn.Module):
         for idx in self.args.text_emb_layers:
           output_embeddings.append(output.hidden_states[idx])
 
-        logits = output.logits[:, -1, :]  # (N, vocab_size)
+        hidden_states = output[0]
+        logits = self.vlm.lm_head(hidden_states)
+        logits = logits.float()
+
+        logits = logits[:, -1, :]  # (N, vocab_size)
         if top_p == 1.0:
           logits = logits.cpu()
         output_logits.append(logits)
@@ -361,7 +402,7 @@ class GILL(nn.Module):
       self.decision_model.load_state_dict(mlp_checkpoint['state_dict'], strict=True)
       self.decision_model.eval()
 
-  def __call__(self, images: Tensor, image_grid_ths: Tensor, input_ids: Optional[Tensor] = None, labels: Optional[Tensor] = None,
+  def __call__(self, images: Tensor, image_grid_thw: Tensor, input_ids: Optional[Tensor] = None, labels: Optional[Tensor] = None,
                caption_start_id: Optional[Tensor] = None, caption_end_id: Optional[Tensor] = None,
                generate: bool = False, num_words: int = 32, temperature: float = 1.0, top_p: float = 1.0,
                ret_scale_factor: float = 1.0, gen_scale_factor: float = 1.0,
@@ -373,7 +414,7 @@ class GILL(nn.Module):
     else:
       output = self.model(
         pixel_values = images,
-        image_grid_ths = image_grid_ths,
+        image_grid_thw = image_grid_thw,
         input_ids = input_ids,
         labels = labels,
         caption_start_id = caption_start_id,

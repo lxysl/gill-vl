@@ -23,20 +23,20 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
   model_modes = ['captioning', 'retrieval', 'generation']
   num_words = 32  # Number of words to generate.
 
-  feature_extractor = utils.get_feature_extractor_for_model(args.visual_model, image_size=args.image_size, train=False)
+  # feature_extractor = utils.get_feature_extractor_for_model(args.visual_model, image_size=args.image_size, train=False)
 
-  def get_pixel_values_from_path(path: str):
-    img = Image.open(path)
-    img = img.resize((args.image_size, args.image_size))
-    pixel_values = utils.get_pixel_values_for_model(feature_extractor, img)[None, ...]
+  # def get_pixel_values_from_path(path: str):
+  #   img = Image.open(path)
+  #   img = img.resize((args.image_size, args.image_size))
+  #   pixel_values = utils.get_pixel_values_for_model(feature_extractor, img)[None, ...]
 
-    if args.precision == 'fp16':
-        pixel_values = pixel_values.half()
-    elif args.precision == 'bf16':
-        pixel_values = pixel_values.bfloat16()
-    if torch.cuda.is_available():
-      pixel_values = pixel_values.cuda()
-    return pixel_values
+  #   if args.precision == 'fp16':
+  #       pixel_values = pixel_values.half()
+  #   elif args.precision == 'bf16':
+  #       pixel_values = pixel_values.bfloat16()
+  #   if torch.cuda.is_available():
+  #     pixel_values = pixel_values.cuda()
+  #   return pixel_values
 
   def run_validate(loader, base_progress=0):
     with torch.no_grad():
@@ -47,14 +47,15 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
       all_image_features = []
       all_text_features = []
 
-      for i, (image_paths, images, caption_images, ret_tokens, ret_caption_len, gen_tokens, gen_caption_len, clip_emb) in tqdm.tqdm(enumerate(loader), position=0, total=len(loader)):
+      for i, (image_paths, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb) in tqdm.tqdm(
+        enumerate(loader), position=0, total=len(loader)):
         i = base_progress + i
 
         if torch.cuda.is_available():
-          ret_tokens = ret_tokens.cuda(args.gpu, non_blocking=True)
-          ret_caption_len = ret_caption_len.cuda(args.gpu, non_blocking=True)
-          gen_tokens = gen_tokens.cuda(args.gpu, non_blocking=True)
-          gen_caption_len = gen_caption_len.cuda(args.gpu, non_blocking=True)
+          cap_token_ids = cap_token_ids.cuda(args.gpu, non_blocking=True)
+          cap_labels = cap_labels.cuda(args.gpu, non_blocking=True)
+          gen_token_ids = gen_token_ids.cuda(args.gpu, non_blocking=True)
+          gen_labels = gen_labels.cuda(args.gpu, non_blocking=True)
           images = images.cuda()
           clip_emb = clip_emb.cuda()
 
@@ -66,14 +67,14 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
         for model_mode in model_modes:
           # compute output
           if model_mode == 'retrieval':
-            tgt_tokens, token_len = ret_tokens, ret_caption_len
+            input_ids, labels, caption_start_id, caption_end_id = gen_token_ids, gen_labels, gen_start_id, gen_end_id
           elif model_mode == 'generation':
-            tgt_tokens, token_len = gen_tokens, gen_caption_len
+            input_ids, labels, caption_start_id, caption_end_id = gen_token_ids, gen_labels, gen_start_id, gen_end_id
           else:
-            tgt_tokens, token_len = ret_tokens, ret_caption_len  # For captioning, it doesn't matter.
+            input_ids, labels, caption_start_id, caption_end_id = cap_token_ids, cap_labels, cap_start_id, cap_end_id  # For captioning, it doesn't matter.
 
           (model_output, full_labels, last_embedding, _, visual_embs, visual_embs_norm,
-            input_embs_norm, _) = model(images, tgt_tokens, token_len, mode=model_mode, input_prefix=args.input_prompt)  # (N, T, C)
+            input_embs_norm, _) = model(images, image_grid_thw, input_ids, labels, caption_start_id, caption_end_id, mode=model_mode)  # (N, T, C)
 
           if model_mode == 'captioning':
             loss = args.cap_loss_scale * model_output.loss
@@ -121,20 +122,29 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
 
           # Run auto-regressive generation sample
           if model_mode == 'captioning':
-            min_word_tokens = num_words
+            input_embs = model.module.model.input_embeddings(input_ids)
+            visual_embs = model.module.model.get_visual_embs(images, image_grid_thw, mode='captioning')  # (2, n_visual_tokens, D)
+            visual_mask = (
+              (input_ids == model.module.model.vlm.config.image_token_id)
+              .unsqueeze(-1)
+              .expand_as(input_embs)
+              .to(input_embs.device)
+            )
+            visual_embs = visual_embs.to(input_embs.device, input_embs.dtype)
+            input_embs = input_embs.masked_scatter(visual_mask, visual_embs)
+            input_embs = input_embs[:, :cap_start_id[0], :]  # all cap_start_id are the same
 
-            input_embs = model.module.model.get_visual_embs(images, mode='captioning')  # (2, n_visual_tokens, D)
-            if args.input_prompt is not None:
-              print(f'Adding prefix "{args.input_prompt}" to captioning generate=True.')
-              prompt_ids = tokenizer(args.input_prompt, add_special_tokens=True, return_tensors="pt").input_ids
-              prompt_ids = prompt_ids.to(visual_embs.device)
-              prompt_embs = model.module.model.input_embeddings(prompt_ids)
-              prompt_embs = prompt_embs.repeat(input_embs.shape[0], 1, 1)
-              input_embs = torch.cat([input_embs, prompt_embs], dim=1)
+            pad_ids = torch.full_like(input_ids, tokenizer.pad_token_id, device=input_ids.device)
+            pad_embs = model.module.model.input_embeddings(pad_ids)
+            for k in range(len(pad_embs)):
+              pad_ids[k, :cap_end_id[k] - cap_start_id[k]] = input_ids[k, cap_start_id[k]:cap_end_id[k]]  # right padding
+              pad_embs[k, -cap_start_id[k]:] = input_embs[k, :cap_start_id[k]]  # left padding
+            input_ids = pad_ids[:num_words]
+            input_embs = pad_embs
 
-            generated_ids, _, _ = model(input_embs, tgt_tokens, token_len,
-              generate=True, num_words=num_words, temperature=0.0, top_p=1.0,
-              min_word_tokens=min_word_tokens)
+            generated_ids, _, _ = model(input_embs, None, input_ids, None, None, None,
+                                        generate=True, num_words=num_words, temperature=0.0, top_p=1.0,
+                                        min_word_tokens=num_words)
 
             if args.distributed and ngpus_per_node > 1:
               all_generated_ids = [torch.zeros_like(generated_ids) for _ in range(dist.get_world_size())]
@@ -142,9 +152,9 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
               all_generated_ids[dist.get_rank()] = generated_ids
               generated_ids = torch.cat(all_generated_ids)
 
-              all_tgt_tokens = [torch.zeros_like(tgt_tokens) for _ in range(dist.get_world_size())]
-              dist.all_gather(all_tgt_tokens, tgt_tokens)
-              all_tgt_tokens[dist.get_rank()] = tgt_tokens
+              all_tgt_tokens = [torch.zeros_like(input_ids) for _ in range(dist.get_world_size())]
+              dist.all_gather(all_tgt_tokens, input_ids)
+              all_tgt_tokens[dist.get_rank()] = input_ids
               all_tgt_tokens = torch.cat(all_tgt_tokens)
 
               all_image_paths = [[None for _ in image_paths] for _ in range(dist.get_world_size())]
@@ -154,7 +164,7 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
               for p in all_image_paths:
                 image_paths.extend(p)
             else:
-              all_tgt_tokens = tgt_tokens
+              all_tgt_tokens = input_ids
 
             all_tgt_tokens[all_tgt_tokens == -100] = tokenizer.pad_token_id
             generated_captions = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
@@ -172,12 +182,14 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
           elif model_mode in ['retrieval', 'generation']:
             if i == 0:
               # Generate without conditions just to test.
-              input_ids = tgt_tokens[:, :3]  # Use first 3 tokens as initial prompt for generation.
-              input_embs = model.module.model.input_embeddings(input_ids)  # (N, T, D)
-              generated_ids, _, _ = model(input_embs, tgt_tokens, token_len, generate=True, num_words=num_words, temperature=0.0, top_p=1.0)
-              generated_ids = torch.cat([input_ids, generated_ids], dim=1)
+              ret_token_ids = input_ids[:, :3]  # Use first 3 tokens as initial prompt for generation. (A photo of)
+              input_embs = model.module.model.input_embeddings(ret_token_ids)  # (N, T, D)
+              generated_ids, _, _ = model(input_embs, None, input_ids, None, None, None,
+                                          generate=True, num_words=num_words, temperature=0.0, top_p=1.0,
+                                          min_word_tokens=num_words)
+              generated_ids = torch.cat([ret_token_ids, generated_ids], dim=1)
               generated_captions = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
-              gt_captions = tokenizer.batch_decode(tgt_tokens, skip_special_tokens=False)
+              gt_captions = tokenizer.batch_decode(input_ids[:num_words], skip_special_tokens=False)
           else:
             raise NotImplementedError
 

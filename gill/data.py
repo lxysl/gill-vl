@@ -4,6 +4,7 @@ from typing import Optional, Tuple, List
 
 import collections
 import logging
+import traceback
 import os
 import numpy as np
 import pandas as pd
@@ -54,13 +55,13 @@ def get_dataset(args, split: str, processor, tokenizer, precision: str = 'fp32')
     print(f'{len(dataset_paths)} datasets requested: {dataset_paths}')
     dataset = torch.utils.data.ConcatDataset([
       CsvDataset(path, image_dir, processor, 'image',
-        'caption', args.visual_model, tokenizer, train=train, max_len=args.max_len, precision=args.precision,
+        'caption', None, tokenizer, train=train, max_len=args.max_len, precision=args.precision,
         image_size=args.image_size, retrieval_token_idx=args.retrieval_token_idx, gen_token_idx=args.gen_token_idx, 
         num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens, input_prompt=args.input_prompt)
       for (path, image_dir) in zip(dataset_paths, image_data_dirs)])
   elif len(dataset_paths) == 1:
     dataset = CsvDataset(dataset_paths[0], image_data_dirs[0], processor, 'image',
-      'caption', args.visual_model, tokenizer, train=train, max_len=args.max_len, precision=args.precision,
+      'caption', None, tokenizer, train=train, max_len=args.max_len, precision=args.precision,
       image_size=args.image_size, retrieval_token_idx=args.retrieval_token_idx, gen_token_idx=args.gen_token_idx, 
       num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens, input_prompt=args.input_prompt)
   else:
@@ -71,7 +72,7 @@ def get_dataset(args, split: str, processor, tokenizer, precision: str = 'fp32')
 class CsvDataset(Dataset):
   def __init__(self, input_filename, base_image_dir, processor, img_key,
                caption_key, feature_extractor_model: str=None, tokenizer=None,
-               train: bool = True, max_len: int = 200, sep="\t", precision: str = 'fp32',
+               train: bool = True, max_len: int = 128, sep="\t", precision: str = 'fp32',
                image_size: int = 224, retrieval_token_idx: List[int] = [-1], gen_token_idx: List[int] = [-1],
                num_tokens: int = 1, num_clip_tokens: int = 1, input_prompt: str = ""):
     logging.debug(f'Loading tsv data from {input_filename}.')
@@ -139,12 +140,12 @@ class CsvDataset(Dataset):
 
         labels = self.tokenizer.encode(caption, add_special_tokens=False, return_tensors="pt")[0]
         labels[-self.num_tokens:] = -100
-        captioning_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        captioning_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)[:-1]  # remove the end '\n'
 
         image_inputs, _ = process_vision_info(messages)
         image_inputs = self.processor.image_processor(images=image_inputs, videos=None)
         images = image_inputs["pixel_values"]
-        image_grid_thw = image_inputs["image_grid_thw"]
+        image_grid_thw = image_inputs["image_grid_thw"][0]
 
         # --- mode == 'captioning' ---
         # input_ids: [<|im_start|>...<|im_start|>assistant\nA picture of caption[IMG0]...[IMG7], <|im_end|>, <|endoftext|>...]
@@ -158,15 +159,14 @@ class CsvDataset(Dataset):
         # ignore_index at: <|endoftext|>, [IMG0]...[IMG7]
         # supervised_index at: A picture of caption
 
-        merge_length = self.processor.merge_size**2
+        merge_length = self.processor.image_processor.merge_size**2
         index = 0
-        for i in range(len(captioning_text)):
-          while "<|image_pad|>" in captioning_text:
-            captioning_text = captioning_text.replace(
-              "<|image_pad|>", "<|placeholder|>" * (image_grid_thw[index].prod() // merge_length), 1
-            )
-            index += 1
-          captioning_text = captioning_text.replace("<|place_holder|>", "<|image_pad|>")
+        while "<|image_pad|>" in captioning_text:
+          captioning_text = captioning_text.replace(
+            "<|image_pad|>", "<|placeholder|>" * (image_grid_thw[index].prod() // merge_length), 1
+          )
+          index += 1
+        captioning_text = captioning_text.replace("<|placeholder|>", "<|image_pad|>")
         captioning_input_ids = self.tokenizer.encode(
           captioning_text,
           padding_side="right",
@@ -176,7 +176,7 @@ class CsvDataset(Dataset):
           add_special_tokens=False,
           return_tensors="pt"
         )[0]
-        no_pad_captioning_ids = self.tokenizer.encode(captioning_text)[0]
+        no_pad_captioning_ids = self.tokenizer.encode(captioning_text)
         captioning_start_id = len(no_pad_captioning_ids) - len(labels) - 1  # [-> A picture of ...]
         captioning_end_id = len(no_pad_captioning_ids) - self.num_tokens - 1  # [... A picture of caption[IMG0] <-]
 
@@ -206,7 +206,7 @@ class CsvDataset(Dataset):
           captioning_input_ids[-1] = self.tokenizer.eos_token_id
           captioning_labels[-self.num_tokens-1:-1] = -100
           captioning_labels[-1] = self.tokenizer.eos_token_id
-        if gen_input_ids[-1] not in self.gen_token_idx:
+        if gen_input_ids[-1] != self.tokenizer.eos_token_id:
           gen_input_ids[-self.num_tokens-1:-1] = torch.tensor(self.gen_token_idx).to(dtype=gen_input_ids.dtype, device=gen_input_ids.device)
           gen_labels[-self.num_tokens-1:-1] = -100
 
@@ -217,5 +217,6 @@ class CsvDataset(Dataset):
         return image_path, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb
       except Exception as e:
         print(f'Error reading for {image_path} with caption {caption}: {e}')
+        traceback.print_exc()
         # Pick a new example at random.
         idx = np.random.randint(0, len(self)-1)

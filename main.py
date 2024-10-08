@@ -122,7 +122,7 @@ def parse_args(args):
   parser.add_argument('--ret-emb-dim', default=256, type=int, metavar='N', help='Embedding dimension for retrieval.')
   parser.add_argument('--gen-emb-dim', default=768, type=int, metavar='N', help='Embedding dimension for generation.')
 
-  parser.add_argument('--min-pixels', default=4*28*28, type=int, metavar='N*28*28', help='Minimum number of pixels for a valid image.')
+  parser.add_argument('--min-pixels', default=32*28*28, type=int, metavar='N*28*28', help='Minimum number of pixels for a valid image.')
   parser.add_argument('--max-pixels', default=32*28*28, type=int, metavar='N*28*28', help='Maximum number of pixels for a valid image.')
   
   text_fc_modes = ['linear', 'gill_mapper']
@@ -131,7 +131,7 @@ def parse_args(args):
   parser.add_argument('--ret-text-fc-mode', default='linear',
             choices=text_fc_modes, help='What kind of translation mapping to use.')
 
-  parser.add_argument('--max-len', default=32, type=int,
+  parser.add_argument('--max-len', default=128, type=int,
             metavar='N', help='Maximum length to truncate captions / generations to.')
   parser.add_argument('--n-visual-tokens', default=4, type=int,
             metavar='N', help='Number of visual tokens to use for the Frozen model.')
@@ -249,6 +249,7 @@ def main_worker(gpu, ngpus_per_node, args):
   model_args.ret_text_fc_mode = args.ret_text_fc_mode
   model_args.num_tokens = args.num_tokens
   model_args.num_clip_tokens = args.num_clip_tokens
+  model_args.precision = args.precision
   assert args.num_tokens == 0 or 'gill_mapper' in model_args.text_fc_mode or (args.num_tokens * args.gen_emb_dim == args.num_clip_tokens * 768 or args.num_tokens * args.gen_emb_dim == args.num_clip_tokens * 1024), (f'{args.num_tokens} * {args.gen_emb_dim} != {args.num_clip_tokens} * 768 (or 1024)')
 
   processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct", min_pixels=args.min_pixels, max_pixels=args.max_pixels)
