@@ -141,7 +141,7 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
             for k in range(len(pad_embs)):
               pad_ids[k, :cap_end_id[k] - cap_start_id[k]] = input_ids[k, cap_start_id[k]:cap_end_id[k]]  # right padding
               pad_embs[k, -cap_start_id[k]:] = input_embs[k, :cap_start_id[k]]  # left padding
-            input_ids = pad_ids[:, :num_words, :]
+            input_ids = pad_ids[:, :num_words]
             input_embs = pad_embs
 
             generated_ids, _, _ = model(input_embs, None, input_ids, None, None, None,
