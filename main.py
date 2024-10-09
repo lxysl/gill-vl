@@ -407,7 +407,7 @@ def main_worker(gpu, ngpus_per_node, args):
       # Only save non-frozen parameters.
       stripped_state_dict = {
           k: v for k, v in model.state_dict().items() if 
-          ('.lm' not in k and '.visual_model' not in k)
+          ('.vlm' not in k and '.lm' not in k and '.visual_model' not in k)
       }
       stripped_state_dict = OrderedDict(sorted(stripped_state_dict.items()))
       utils.save_checkpoint({
@@ -464,12 +464,8 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       image_grid_thw = image_grid_thw.cuda(args.gpu, non_blocking=True)
       cap_token_ids = cap_token_ids.cuda(args.gpu, non_blocking=True)
       cap_labels = cap_labels.cuda(args.gpu, non_blocking=True)
-      cap_start_id = cap_start_id.cuda(args.gpu, non_blocking=True)
-      cap_end_id = cap_end_id.cuda(args.gpu, non_blocking=True)
       gen_token_ids = gen_token_ids.cuda(args.gpu, non_blocking=True)
       gen_labels = gen_labels.cuda(args.gpu, non_blocking=True)
-      gen_start_id = gen_start_id.cuda(args.gpu, non_blocking=True)
-      gen_end_id = gen_end_id.cuda(args.gpu, non_blocking=True)
       clip_emb = clip_emb.cuda(args.gpu, non_blocking=True)
 
     if args.precision == 'fp16':

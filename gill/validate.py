@@ -56,12 +56,8 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
         if torch.cuda.is_available():
           cap_token_ids = cap_token_ids.cuda(args.gpu, non_blocking=True)
           cap_labels = cap_labels.cuda(args.gpu, non_blocking=True)
-          cap_start_id = cap_start_id.cuda(args.gpu, non_blocking=True)
-          cap_end_id = cap_end_id.cuda(args.gpu, non_blocking=True)
           gen_token_ids = gen_token_ids.cuda(args.gpu, non_blocking=True)
           gen_labels = gen_labels.cuda(args.gpu, non_blocking=True)
-          gen_start_id = gen_start_id.cuda(args.gpu, non_blocking=True)
-          gen_end_id = gen_end_id.cuda(args.gpu, non_blocking=True)
           images = [image.cuda(args.gpu) for image in images]
           image_grid_thw = image_grid_thw.cuda(args.gpu, non_blocking=True)
           clip_emb = clip_emb.cuda(args.gpu, non_blocking=True)
