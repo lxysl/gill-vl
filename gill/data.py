@@ -19,8 +19,26 @@ from gill import utils
 
 
 def collate_fn(batch):
-    batch = list(filter(lambda x: x is not None, batch))
-    return torch.utils.data.dataloader.default_collate(batch)
+  batch = list(filter(lambda x: x is not None, batch))
+  return torch.utils.data.dataloader.default_collate(batch)
+
+
+def custom_images_collate_fn(batch):
+  image_path = [x[0] for x in batch]
+  raw_images = torch.stack([x[1] for x in batch])
+  images = [torch.tensor(x[2]) for x in batch]  # list of pixel values
+  image_grid_thw = torch.stack([torch.tensor(x[3]) for x in batch])
+  cap_img = torch.stack([x[4] for x in batch])
+  captioning_input_ids = torch.stack([x[5] for x in batch])
+  captioning_labels = torch.stack([x[6] for x in batch])
+  captioning_start_id = torch.tensor([x[7] for x in batch])
+  captioning_end_id = torch.tensor([x[8] for x in batch])
+  gen_input_ids = torch.stack([x[9] for x in batch])
+  gen_labels = torch.stack([x[10] for x in batch])
+  gen_start_id = torch.tensor([x[11] for x in batch])
+  gen_end_id = torch.tensor([x[12] for x in batch])
+  clip_emb = torch.stack([torch.tensor(x[13]) for x in batch])
+  return image_path, raw_images, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb
 
 
 def get_dataset(args, split: str, processor, tokenizer, precision: str = 'fp32') -> Dataset:
@@ -146,6 +164,8 @@ class CsvDataset(Dataset):
         image_inputs = self.processor.image_processor(images=image_inputs, videos=None)
         images = image_inputs["pixel_values"]
         image_grid_thw = image_inputs["image_grid_thw"][0]
+        raw_images = Image.open(image_path).convert('RGB').resize((self.image_size, self.image_size))
+        raw_images = T.ToTensor()(raw_images)
 
         # --- mode == 'captioning' ---
         # input_ids: [<|im_start|>...<|im_start|>assistant\nA picture of caption[IMG0]...[IMG7], <|im_end|>, <|endoftext|>...]
@@ -214,7 +234,7 @@ class CsvDataset(Dataset):
         self.font = self.font or ImageFont.load_default()
         cap_img = utils.create_image_of_text(decode_caption.encode('ascii', 'ignore'), width=self.image_size, nrows=2, font=self.font)
 
-        return image_path, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb
+        return image_path, raw_images, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb
       except Exception as e:
         print(f'Error reading for {image_path} with caption {caption}: {e}')
         traceback.print_exc()

@@ -47,22 +47,24 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
       all_image_features = []
       all_text_features = []
 
-      for i, (image_paths, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb) in tqdm.tqdm(
+      for i, (image_paths, raw_images, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb) in tqdm.tqdm(
         enumerate(loader), position=0, total=len(loader)):
+        # images is a list of pixel values of different shapes
         i = base_progress + i
+        batch_size = len(images)
 
         if torch.cuda.is_available():
           cap_token_ids = cap_token_ids.cuda(args.gpu, non_blocking=True)
           cap_labels = cap_labels.cuda(args.gpu, non_blocking=True)
           gen_token_ids = gen_token_ids.cuda(args.gpu, non_blocking=True)
           gen_labels = gen_labels.cuda(args.gpu, non_blocking=True)
-          images = images.cuda()
+          images = [image.cuda(args.gpu) for image in images]
           clip_emb = clip_emb.cuda()
 
         if args.precision == 'fp16':
-          images = images.half()
+          images = [image.half() for image in images]
         elif args.precision == 'bf16':
-          images = images.bfloat16()
+          images = [image.bfloat16() for image in images]
 
         for model_mode in model_modes:
           # compute output
@@ -88,9 +90,9 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
           output = model_output.logits
           if model_mode == 'captioning':
             acc1, acc5 = utils.accuracy(output[:, :-1, :], full_labels[:, 1:], -100, topk=(1, 5))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
-            ce_losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], batch_size)
+            top5.update(acc5[0], batch_size)
+            ce_losses.update(loss.item(), batch_size)
           elif model_mode == 'retrieval':
             if args.distributed:
               original_last_embedding = torch.clone(last_embedding)
@@ -105,8 +107,8 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
               all_last_embedding[dist.get_rank()] = last_embedding
               visual_embs = torch.cat(all_visual_embs)
               last_embedding = torch.cat(all_last_embedding)
-              start_idx = args.rank * images.shape[0]
-              end_idx = start_idx + images.shape[0]
+              start_idx = args.rank * batch_size
+              end_idx = start_idx + batch_size
               assert torch.all(last_embedding[start_idx:end_idx] == original_last_embedding), args.rank
 
             all_text_features.append(last_embedding.cpu())
@@ -132,14 +134,14 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
             )
             visual_embs = visual_embs.to(input_embs.device, input_embs.dtype)
             input_embs = input_embs.masked_scatter(visual_mask, visual_embs)
-            input_embs = input_embs[:, :cap_start_id[0], :]  # all cap_start_id are the same
+            # input_embs = input_embs[:, :cap_start_id[0], :]  # all cap_start_id are the same
 
             pad_ids = torch.full_like(input_ids, tokenizer.pad_token_id, device=input_ids.device)
             pad_embs = model.module.model.input_embeddings(pad_ids)
             for k in range(len(pad_embs)):
               pad_ids[k, :cap_end_id[k] - cap_start_id[k]] = input_ids[k, cap_start_id[k]:cap_end_id[k]]  # right padding
               pad_embs[k, -cap_start_id[k]:] = input_embs[k, :cap_start_id[k]]  # left padding
-            input_ids = pad_ids[:num_words]
+            input_ids = pad_ids[:, :num_words, :]
             input_embs = pad_embs
 
             generated_ids, _, _ = model(input_embs, None, input_ids, None, None, None,
@@ -208,7 +210,7 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
             # Write images.
             if not args.distributed or (args.rank % ngpus_per_node == 0):
               max_images_to_show = 16
-              normalized_images = images - images.min()
+              normalized_images = raw_images - raw_images.min()
               normalized_images /= normalized_images.max()  # (N, 3, H, W)
               # Create generated caption text.
               generated_cap_images = torch.stack([
@@ -222,8 +224,8 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
               grid = torchvision.utils.make_grid(display_images, nrow=int(max_images_to_show ** 0.5), padding=4)
               writer.add_image(f'val/images_{model_mode}', grid, actual_step)
 
-          vis_emb_norm.update(visual_embs_norm.item(), images.size(0))
-          inp_emb_norm.update(input_embs_norm.item(), images.size(0))
+          vis_emb_norm.update(visual_embs_norm.item(), batch_size)
+          inp_emb_norm.update(input_embs_norm.item(), batch_size)
 
           # measure elapsed time
           batch_time.update(time.time() - end)

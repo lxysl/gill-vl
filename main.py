@@ -254,14 +254,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
   processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct", min_pixels=args.min_pixels, max_pixels=args.max_pixels)
   tokenizer = processor.tokenizer
-  # if tokenizer.pad_token is None:
-  #   if args.opt_version in ['EleutherAI/gpt-j-6B']:
-  #     tokenizer.pad_token = tokenizer.eos_token
-  #   else:
-  #     tokenizer.pad_token_id = tokenizer.eos_token_id
-  #   print("tokenizer.pad_token, tokenizer.eos_token:", tokenizer.pad_token, tokenizer.eos_token)
-  # # Add an image token for loss masking (and visualization) purposes.
-  # tokenizer.add_special_tokens({"cls_token": "<|image|>"})  # add special image token to tokenizer
 
   # Add [IMG] tokens to the vocabulary.
   model_args.retrieval_token_idx = []
@@ -383,11 +375,11 @@ def main_worker(gpu, ngpus_per_node, args):
 
   train_loader = torch.utils.data.DataLoader(
     train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-    num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+    num_workers=args.workers, pin_memory=True, sampler=train_sampler, collate_fn=data.custom_images_collate_fn)
 
   val_loader = torch.utils.data.DataLoader(
     val_dataset, batch_size=(args.val_batch_size or args.batch_size), shuffle=False,
-    num_workers=args.workers, pin_memory=True, sampler=val_sampler)
+    num_workers=args.workers, pin_memory=True, sampler=val_sampler, collate_fn=data.custom_images_collate_fn)
 
   if args.evaluate:
     validate.validate(val_loader, model, tokenizer, criterion, epoch, args)
@@ -460,13 +452,15 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
   model.train()
   end = time.time()
 
-  for i, (_, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb) in enumerate(train_loader):
+  for i, (_, raw_images, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb) in enumerate(train_loader):
+    # images is a list of pixel values of different shapes
     actual_step = epoch * args.steps_per_epoch + i + 1
     # measure data loading time
     data_time.update(time.time() - end)
+    batch_size = len(images)
 
     if torch.cuda.is_available():
-      images = images.cuda(args.gpu, non_blocking=True)
+      images = [image.cuda(args.gpu, non_blocking=True) for image in images]
       cap_token_ids = cap_token_ids.cuda(args.gpu, non_blocking=True)
       cap_labels = cap_labels.cuda(args.gpu, non_blocking=True)
       gen_token_ids = gen_token_ids.cuda(args.gpu, non_blocking=True)
@@ -474,9 +468,9 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       clip_emb = clip_emb.cuda(args.gpu, non_blocking=True)
 
     if args.precision == 'fp16':
-      images = images.half()
+      images = [image.half() for image in images]
     elif args.precision == 'bf16':
-      images = images.bfloat16()
+      images = [image.bfloat16() for image in images]
 
     model_modes = ['captioning', 'retrieval', 'generation']
 
@@ -501,8 +495,8 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       # Measure captioning accuracy for multi-task models and next-token prediction for retrieval models.
       if model_mode == 'captioning':
         acc1, acc5 = utils.accuracy(output[:, :-1, :], full_labels[:, 1:], -100, topk=(1, 5))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        top1.update(acc1[0], batch_size)
+        top5.update(acc5[0], batch_size)
 
       ce_loss = model_output.loss
       if model_mode == 'captioning':
@@ -514,7 +508,7 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       else:
         raise NotImplementedError
       loss += ce_loss
-      ce_losses.update(ce_loss.item(), images.size(0))
+      ce_losses.update(ce_loss.item(), batch_size)
 
       if model_mode == 'retrieval':
         # Cross replica concat for embeddings.
@@ -529,8 +523,8 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
           visual_embs = torch.cat(all_visual_embs)
           last_embedding = torch.cat(all_last_embedding)
 
-          start_idx = args.rank * images.shape[0]
-          end_idx = start_idx + images.shape[0]
+          start_idx = args.rank * batch_size
+          end_idx = start_idx + batch_size
 
         print(visual_embs.shape, last_embedding.shape)
         logits_per_image = visual_embs @ last_embedding.t()
@@ -543,13 +537,13 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
         caption_acc1, caption_acc5 = losses_utils.contrastive_acc(logits_per_text, topk=(1, 5))
         image_acc1, image_acc5 = losses_utils.contrastive_acc(logits_per_image, topk=(1, 5))
         loss += args.ret_loss_scale * (caption_loss + image_loss) / 2.0
-        cont_losses.update(loss.item(), images.size(0))
+        cont_losses.update(loss.item(), batch_size)
 
         # measure accuracy and record loss
-        top1_caption.update(caption_acc1[0], images.size(0))
-        top5_caption.update(caption_acc5[0], images.size(0))
-        top1_image.update(image_acc1[0], images.size(0))
-        top5_image.update(image_acc5[0], images.size(0))
+        top1_caption.update(caption_acc1[0], batch_size)
+        top5_caption.update(caption_acc5[0], batch_size)
+        top1_image.update(image_acc1[0], batch_size)
+        top5_image.update(image_acc5[0], batch_size)
       elif model_mode == 'generation':
         if args.num_tokens != 0 and args.num_clip_tokens != args.num_tokens:
           seq_len = clip_emb.shape[1]
@@ -559,15 +553,15 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
         image_loss = losses_utils.l2_loss(clip_emb, last_embedding)  # (N,)
         gen_loss = args.gen_loss_scale * image_loss.mean()
         loss += gen_loss
-        gen_losses.update(gen_loss.item(), images.size(0))
+        gen_losses.update(gen_loss.item(), batch_size)
 
 
       if model_mode == 'retrieval':
-        ret_vis_emb_norm.update(visual_embs_norm.item(), images.size(0))
+        ret_vis_emb_norm.update(visual_embs_norm.item(), batch_size)
       elif model_mode == 'captioning':
-        cap_vis_emb_norm.update(visual_embs_norm.item(), images.size(0))
+        cap_vis_emb_norm.update(visual_embs_norm.item(), batch_size)
 
-      inp_emb_norm.update(input_embs_norm.item(), images.size(0))
+      inp_emb_norm.update(input_embs_norm.item(), batch_size)
 
       if model_mode in ['retrieval', 'generation']:
         ret_time.update(time.time() - mode_start)
@@ -575,7 +569,7 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
         cap_time.update(time.time() - mode_start)
 
     loss = loss / args.grad_accumulation_steps
-    losses.update(loss.item(), images.size(0))
+    losses.update(loss.item(), batch_size)
     loss.backward()
 
     # Update weights
@@ -608,8 +602,8 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       # Log norms to Tensorboard.
       embedding_norm = torch.norm(model.module.model.input_embeddings.weight, dim=1).mean()
       ret_embedding_norm = torch.norm(model.module.model.input_embeddings.weight[args.retrieval_token_idx, :], dim=-1).mean()
-      all_emb_norm.update(embedding_norm.item(), images.size(0))
-      ret_emb_norm.update(ret_embedding_norm.item(), images.size(0))
+      all_emb_norm.update(embedding_norm.item(), batch_size)
+      ret_emb_norm.update(ret_embedding_norm.item(), batch_size)
 
     # measure elapsed time
     batch_time.update(time.time() - end)
@@ -673,8 +667,8 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
 
       if not args.multiprocessing_distributed or (args.multiprocessing_distributed
         and args.rank % ngpus_per_node == 0):
-        image_bs = images.shape[0]
-        normalized_images = images - images.min()
+        image_bs = raw_images.shape[0]
+        normalized_images = raw_images - raw_images.min()
         normalized_images /= normalized_images.max()  # (N, 3, H, W)
         max_images_to_show = 16
 

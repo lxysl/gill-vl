@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 from collections import namedtuple
 from diffusers import StableDiffusionPipeline
 import json
@@ -134,17 +134,17 @@ class GILLModel(nn.Module):
     # self.logit_scale = self.logit_scale.bfloat16()
 
 
-  def get_visual_embs(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor, mode: str = 'captioning'):
+  def get_visual_embs(self, pixel_values: List[torch.FloatTensor], image_grid_thw: torch.LongTensor, mode: str = 'captioning'):
     if mode not in ['captioning', 'retrieval', 'generation']:
       raise ValueError(f"mode should be one of ['captioning', 'retrieval', 'generation'], got {mode} instead.")
 
     # Extract visual embeddings from the vision encoder.
     if 'Qwen2' in self.vlm_version:
-      pixel_values = pixel_values.type(self.visual_model.get_dtype())
-      bs, num_tokens, _ = pixel_values.shape
-      pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])  # (N * num_tokens, D)
+      pixel_values = [pixel_value.type(self.visual_model.get_dtype()) for pixel_value in pixel_values]
+      shapes = [pixel_value for pixel_value in pixel_values]
+      pixel_values = torch.cat(pixel_values, dim=0)  # (all_num_tokens, D)
       image_embeds, image_features = self.visual_model(pixel_values, grid_thw=image_grid_thw)  # image_embeds: text dim, image_features: visual dim
-      image_features = image_features.reshape(bs, num_tokens, -1)
+      # image_embeds: (all_num_tokens, D), image_features: (all_num_tokens, D)
     else:
       raise NotImplementedError
 
@@ -152,10 +152,14 @@ class GILLModel(nn.Module):
     if mode == 'captioning':
       visual_embs = image_embeds
     elif mode == 'retrieval':
-      visual_embs = self.visual_fc(image_features[:, 0, :])  # (2, D * n_visual_tokens)
+      visual_embs = self.visual_fc(image_features)
+      sep_ids = torch.cumsum(torch.tensor([shape_i.shape[0] for shape_i in shapes]), dim=0)
+      sep_ids = torch.cat([torch.tensor([0]), sep_ids], dim=0)
+      # visual_embs: (len(shapes), D), take out the first token for each sep_id
+      visual_embs = torch.stack([visual_embs[sep_id] for sep_id in sep_ids[:-1]])
       visual_embs = torch.reshape(visual_embs, (visual_embs.shape[0], 1, -1))
     elif mode == 'generation':
-      visual_embs = torch.zeros((pixel_values.shape[0], 1, 768), device=pixel_values.device)
+      visual_embs = torch.zeros((len(pixel_values), 1, 768), device=pixel_values.device)
     else:
       raise NotImplementedError
 
@@ -173,7 +177,7 @@ class GILLModel(nn.Module):
 
   def forward(
     self,
-    pixel_values: torch.FloatTensor,
+    pixel_values: List[torch.FloatTensor],
     image_grid_thw: torch.LongTensor,
     input_ids: torch.LongTensor = None,
     labels: Optional[torch.LongTensor] = None,
@@ -402,16 +406,18 @@ class GILL(nn.Module):
       self.decision_model.load_state_dict(mlp_checkpoint['state_dict'], strict=True)
       self.decision_model.eval()
 
-  def __call__(self, images: Tensor, image_grid_thw: Tensor, input_ids: Optional[Tensor] = None, labels: Optional[Tensor] = None,
+  def __call__(self, images: Union[Tensor, List], image_grid_thw: Tensor, input_ids: Optional[Tensor] = None, labels: Optional[Tensor] = None,
                caption_start_id: Optional[Tensor] = None, caption_end_id: Optional[Tensor] = None,
                generate: bool = False, num_words: int = 32, temperature: float = 1.0, top_p: float = 1.0,
                ret_scale_factor: float = 1.0, gen_scale_factor: float = 1.0,
                min_word_tokens: int = 0, mode: str = 'captioning') -> Tensor:
     if generate:
+      assert isinstance(images, Tensor), 'images should be a tensor when generate is True'
       return self.model.generate(images, num_words, temperature=temperature, top_p=top_p,
                                  min_word_tokens=min_word_tokens, ret_scale_factor=ret_scale_factor,
                                  gen_scale_factor=gen_scale_factor)
     else:
+      assert isinstance(images, List), 'images should be a list when generate is False'
       output = self.model(
         pixel_values = images,
         image_grid_thw = image_grid_thw,
