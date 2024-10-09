@@ -461,10 +461,15 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
 
     if torch.cuda.is_available():
       images = [image.cuda(args.gpu, non_blocking=True) for image in images]
+      image_grid_thw = image_grid_thw.cuda(args.gpu, non_blocking=True)
       cap_token_ids = cap_token_ids.cuda(args.gpu, non_blocking=True)
       cap_labels = cap_labels.cuda(args.gpu, non_blocking=True)
+      cap_start_id = cap_start_id.cuda(args.gpu, non_blocking=True)
+      cap_end_id = cap_end_id.cuda(args.gpu, non_blocking=True)
       gen_token_ids = gen_token_ids.cuda(args.gpu, non_blocking=True)
       gen_labels = gen_labels.cuda(args.gpu, non_blocking=True)
+      gen_start_id = gen_start_id.cuda(args.gpu, non_blocking=True)
+      gen_end_id = gen_end_id.cuda(args.gpu, non_blocking=True)
       clip_emb = clip_emb.cuda(args.gpu, non_blocking=True)
 
     if args.precision == 'fp16':
@@ -477,7 +482,7 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
     loss = 0
 
     for model_mode in model_modes:
-      print('Running', model_mode)
+      # print('Running', model_mode)
       mode_start = time.time()
       # compute output
 
@@ -526,7 +531,7 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
           start_idx = args.rank * batch_size
           end_idx = start_idx + batch_size
 
-        print(visual_embs.shape, last_embedding.shape)
+        # print(visual_embs.shape, last_embedding.shape)
         logits_per_image = visual_embs @ last_embedding.t()
         logits_per_text = logits_per_image.t()
         if i == 0:
@@ -590,7 +595,7 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
         nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
       optimizer.step()
       optimizer.zero_grad()
-      print('=' * 80)
+      # print('=' * 80)
 
     with torch.no_grad():
       # Normalize trainable embeddings.

@@ -145,7 +145,7 @@ class GILLModel(nn.Module):
     if 'Qwen2' in self.vlm_version:
       pixel_values = [pixel_value.type(self.visual_model.get_dtype()) for pixel_value in pixel_values]
       shapes = [pixel_value for pixel_value in pixel_values]
-      pixel_values = torch.cat(pixel_values, dim=0)  # (all_num_tokens, D)
+      pixel_values = torch.cat(pixel_values, dim=0).to(self.visual_model.device)  # (all_num_tokens, D)
       image_embeds, image_features = self.visual_model(pixel_values, grid_thw=image_grid_thw)  # image_embeds: text dim, image_features: visual dim
       # image_embeds: (all_num_tokens, D), image_features: (all_num_tokens, D)
     else:
@@ -156,8 +156,8 @@ class GILLModel(nn.Module):
       visual_embs = image_embeds
     elif mode == 'retrieval':
       visual_embs = self.visual_fc(image_features)
-      sep_ids = torch.cumsum(torch.tensor([shape_i.shape[0] for shape_i in shapes]), dim=0)
-      sep_ids = torch.cat([torch.tensor([0]), sep_ids], dim=0)
+      sep_ids = torch.cumsum(torch.tensor([shape_i.shape[0] for shape_i in shapes]), dim=0).to(self.visual_model.device)
+      sep_ids = torch.cat([torch.tensor([0], device=self.visual_model.device), sep_ids], dim=0)
       # visual_embs: (len(shapes), D), take out the first token for each sep_id
       visual_embs = torch.stack([visual_embs[sep_id] for sep_id in sep_ids[:-1]])
       visual_embs = torch.reshape(visual_embs, (visual_embs.shape[0], 1, -1))
