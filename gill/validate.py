@@ -134,7 +134,6 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
             )
             visual_embs = visual_embs.to(input_embs.device, input_embs.dtype)
             input_embs = input_embs.masked_scatter(visual_mask, visual_embs)
-            # input_embs = input_embs[:, :cap_start_id[0], :]  # all cap_start_id are the same
 
             pad_ids = torch.full_like(input_ids, tokenizer.pad_token_id, device=input_ids.device)
             pad_embs = model.module.model.input_embeddings(pad_ids)

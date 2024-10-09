@@ -88,6 +88,9 @@ class GILLModel(nn.Module):
     self.gen_token_idx = args.gen_token_idx
     self.lm.resize_token_embeddings(len(self.tokenizer))
 
+    # unfreeze the embedding layer
+    self.lm.embed_tokens.weight.requires_grad = True
+
     self.input_embeddings = self.lm.get_input_embeddings()
 
     if self.args.freeze_vm:
