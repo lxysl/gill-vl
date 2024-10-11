@@ -720,8 +720,8 @@ def load_gill(model_dir: str, load_ret_embs: bool = True, decision_model_fn: str
   for k, v in checkpoint['state_dict'].items():
       state_dict[k.replace('module.', '')] = v
   print(state_dict.keys())
-  img_token_embeddings = state_dict['model.vlm.model.embed_tokens.weight'].cpu().detach()
-  del state_dict['model.vlm.model.embed_tokens.weight']
+  img_token_embeddings = state_dict['model.input_embeddings.weight'].cpu().detach()
+  del state_dict['model.input_embeddings.weight']
 
   model.load_state_dict(state_dict, strict=False)
   # Copy over the embeddings of the [IMG] tokens (while loading the others from the pretrained LLM).
