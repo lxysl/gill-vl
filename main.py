@@ -250,9 +250,11 @@ def main_worker(gpu, ngpus_per_node, args):
   model_args.num_tokens = args.num_tokens
   model_args.num_clip_tokens = args.num_clip_tokens
   model_args.precision = args.precision
+  model_args.min_pixels = args.min_pixels
+  model_args.max_pixels = args.max_pixels
   assert args.num_tokens == 0 or 'gill_mapper' in model_args.text_fc_mode or (args.num_tokens * args.gen_emb_dim == args.num_clip_tokens * 768 or args.num_tokens * args.gen_emb_dim == args.num_clip_tokens * 1024), (f'{args.num_tokens} * {args.gen_emb_dim} != {args.num_clip_tokens} * 768 (or 1024)')
 
-  processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct", min_pixels=args.min_pixels, max_pixels=args.max_pixels)
+  processor = AutoProcessor.from_pretrained(args.vlm_version, min_pixels=args.min_pixels, max_pixels=args.max_pixels)
   tokenizer = processor.tokenizer
 
   # Add [IMG] tokens to the vocabulary.

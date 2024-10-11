@@ -1,4 +1,4 @@
-from typing import List, Optional, Union
+from typing import List, Dict, Optional, Union
 from collections import namedtuple
 from diffusers import StableDiffusionPipeline
 import json
@@ -13,7 +13,7 @@ import pickle as pkl
 from PIL import Image, UnidentifiedImageError
 from requests.exceptions import ConnectionError
 
-from transformers import AutoTokenizer, AutoModel, CLIPVisionModel
+from transformers import AutoProcessor, AutoTokenizer, AutoModel, CLIPVisionModel
 from gill.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLCausalLMOutputWithPast
 from gill import utils
 from gill import layers
@@ -36,6 +36,8 @@ class GILLArgs:
   num_tokens: int = 8
   num_clip_tokens: int = 77
   precision: str = 'fp32'
+  min_pixels: int = 32*28*28
+  max_pixels: int = 32*28*28
 
 
 class GILLModel(nn.Module):
@@ -432,14 +434,14 @@ class GILL(nn.Module):
       return output
 
   def generate_for_images_and_texts(
-    self, prompts: List, num_words: int = 0, min_word_tokens: int = 0, ret_scale_factor: float = 1.0, gen_scale_factor: float = 1.0,
+    self, prompts: Dict, num_words: int = 0, min_word_tokens: int = 0, ret_scale_factor: float = 1.0, gen_scale_factor: float = 1.0,
     top_p: float = 1.0, temperature: float = 0.0, max_num_rets: int = 1, generator=None, 
     always_add_bos : bool = False, guidance_scale: float = 7.5, num_inference_steps: int = 50):
     """
     Encode prompts into embeddings, and generates text and image outputs accordingly.
 
     Args:
-      prompts: List of interleaved PIL.Image.Image and strings representing input to the model.
+      prompts: Dict of input_ids, pixel_values, and image_grid_thw.
       num_words: Maximum number of words to generate for. If num_words = 0, the model will run its forward pass and return the outputs.
       min_word_tokens: Minimum number of actual words before generating an image.
       ret_scale_factor: Proportion to scale [IMG] token logits by. A higher value may increase the probability of the model generating [IMG] outputs.
@@ -449,33 +451,19 @@ class GILL(nn.Module):
     Returns:
       return_outputs: List consisting of either str or List[PIL.Image.Image] objects, representing image-text interleaved model outputs.
     """
-    input_embs = []
-    input_ids = []
-    add_bos = True
 
     with torch.no_grad():
-      for p in prompts:
-        if type(p) == Image.Image:
-          # Encode as image.
-          pixel_values = utils.get_pixel_values_for_model(self.model.feature_extractor, p)
-          pixel_values = pixel_values.to(device=self.model.logit_scale.device, dtype=self.model.logit_scale.dtype)
-          pixel_values = pixel_values[None, ...]
-
-          visual_embs = self.model.get_visual_embs(pixel_values, mode='captioning')  # (1, n_visual_tokens, D)
-          input_embs.append(visual_embs)
-        elif type(p) == str:
-          text_ids = self.model.tokenizer(p, add_special_tokens=add_bos, return_tensors="pt").input_ids.to(self.model.logit_scale.device)
-          # Only add <bos> once unless the flag is set.
-          if not always_add_bos:
-            add_bos = False
-
-          text_embs = self.model.input_embeddings(text_ids)  # (1, T, D)
-          input_embs.append(text_embs)
-          input_ids.append(text_ids)
-        else:
-          raise ValueError(f'Input prompts should be either PIL.Image.Image or str types, got {type(p)} instead.')
-      input_embs = torch.cat(input_embs, dim=1)
-      input_ids = torch.cat(input_ids, dim=1)
+      input_embs = self.model.input_embeddings(prompts['input_ids'])
+      if 'pixel_values' in prompts and 'image_grid_thw' in prompts:
+        visual_embs = self.model.get_visual_embs(prompts['pixel_values'], prompts['image_grid_thw'], mode='captioning')
+        visual_mask = (
+          (prompts['input_ids'] == self.model.processor.image_token_id)
+          .unsqueeze(1)
+          .expand_as(input_embs)
+          .to(input_embs.device)
+        )
+        visual_embs = visual_embs.to(input_embs.device, dtype=input_embs.dtype)
+        input_embs = input_embs.masked_scatter(visual_mask, visual_embs)
 
       if num_words == 0:
         raise NotImplementedError('Generation not implemented for num_words=0.')
@@ -581,14 +569,14 @@ class GILL(nn.Module):
               gen_images.extend(
                 self.sd_pipe(prompt_embeds=gen_emb[i:i+gen_max_bs], generator=generator,
                              guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images)
-
-            all_gen_pixels = []
-            for img in gen_images:
-              pixel_values = utils.get_pixel_values_for_model(self.model.feature_extractor, img.resize((224, 224)).convert('RGB'))
-              pixel_values = pixel_values.to(device=self.model.logit_scale.device, dtype=self.model.logit_scale.dtype)
-              all_gen_pixels.append(pixel_values)
             
             if self.emb_matrix is not None:
+              all_gen_pixels = []
+              for img in gen_images:
+                pixel_values = utils.get_pixel_values_for_model(self.model.feature_extractor, img.resize((224, 224)).convert('RGB'))
+                pixel_values = pixel_values.to(device=self.model.logit_scale.device, dtype=self.model.logit_scale.dtype)
+                all_gen_pixels.append(pixel_values)
+
               all_gen_pixels = torch.stack(all_gen_pixels, dim=0)
               gen_visual_embs = self.model.get_visual_embs(all_gen_pixels, mode='retrieval')  # (1, D)
               gen_visual_embs = gen_visual_embs / gen_visual_embs.norm(dim=-1, keepdim=True)
@@ -661,7 +649,7 @@ class GILL(nn.Module):
 
 def load_gill(model_dir: str, load_ret_embs: bool = True, decision_model_fn: str = 'decision_model.pth.tar') -> GILL:
   model_args_path = os.path.join(model_dir, 'model_args.json')
-  model_ckpt_path = os.path.join(model_dir, 'pretrained_ckpt.pth.tar')
+  model_ckpt_path = os.path.join(model_dir, 'ckpt_best.pth.tar')
   embs_paths = [s for s in glob.glob(os.path.join(model_dir, 'cc3m*.npy'))]
 
   if not os.path.exists(model_args_path):
@@ -694,11 +682,8 @@ def load_gill(model_dir: str, load_ret_embs: bool = True, decision_model_fn: str
     model_kwargs = json.load(f)
 
   # Initialize tokenizer.
-  tokenizer = AutoTokenizer.from_pretrained(model_kwargs['opt_version'], use_fast=False)
-  if tokenizer.pad_token is None:
-      tokenizer.pad_token_id = tokenizer.eos_token_id
-  # Add an image token for loss masking (and visualization) purposes.
-  tokenizer.add_special_tokens({"cls_token": "<|image|>"})  # add special image token to tokenizer
+  processor = AutoProcessor.from_pretrained(model_kwargs['vlm_version'], min_pixels=model_kwargs['min_pixels'], max_pixels=model_kwargs['max_pixels'])
+  tokenizer = processor.tokenizer
 
   # Add [IMG] tokens to the vocabulary.
   model_kwargs['retrieval_token_idx'] = []
@@ -722,7 +707,7 @@ def load_gill(model_dir: str, load_ret_embs: bool = True, decision_model_fn: str
     decision_model_path = None
 
   # Initialize model for inference.
-  model = GILL(tokenizer, args, path_array=path_array, emb_matrix=emb_matrix,
+  model = GILL(processor, args, path_array=path_array, emb_matrix=emb_matrix,
                load_sd=True, num_gen_images=1, decision_model_path=decision_model_path)
   model = model.eval()
   model = model.bfloat16()
@@ -734,15 +719,16 @@ def load_gill(model_dir: str, load_ret_embs: bool = True, decision_model_fn: str
   # This is needed if we train with DDP.
   for k, v in checkpoint['state_dict'].items():
       state_dict[k.replace('module.', '')] = v
-  img_token_embeddings = state_dict['model.input_embeddings.weight'].cpu().detach()
-  del state_dict['model.input_embeddings.weight']
+  print(state_dict.keys())
+  img_token_embeddings = state_dict['model.vlm.model.embed_tokens.weight'].cpu().detach()
+  del state_dict['model.vlm.model.embed_tokens.weight']
 
   model.load_state_dict(state_dict, strict=False)
   # Copy over the embeddings of the [IMG] tokens (while loading the others from the pretrained LLM).
   with torch.no_grad():
       if 'share_ret_gen' in model_kwargs:
         assert model_kwargs['share_ret_gen'], 'Model loading only supports share_ret_gen=True for now.'
-      model.model.input_embeddings.weight[-model_kwargs['num_tokens']:, :].copy_(img_token_embeddings)
+      model.model.input_embeddings.weight.copy_(img_token_embeddings)
 
   if load_ret_embs and len(embs_paths) > 0:
     logit_scale = model.model.logit_scale.exp()
