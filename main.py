@@ -62,6 +62,7 @@ def parse_args(args):
                         ' (default: "Qwen/Qwen2-VL-2B-Instruct")')
   parser.add_argument('--num-tokens', default=8, type=int, metavar='N', help='Number of [IMG] tokens to use.')
   parser.add_argument('--num-clip-tokens', default=77, type=int, metavar='N', help='Number of CLIP token to use for generation.')
+  parser.add_argument('--num-t5-tokens', default=256, type=int, metavar='N', help='Number of T5 token to use for generation.')
 
   parser.add_argument('-d', '--dataset', metavar='DATASET',  help='Delimited list of datasets:' +
                       ' | '.join(datasets), default='cc3.1m',
@@ -121,11 +122,12 @@ def parse_args(args):
   parser.add_argument('--image-size', default=224, type=int, metavar='N', help='Size of images.')
   parser.add_argument('--ret-emb-dim', default=256, type=int, metavar='N', help='Embedding dimension for retrieval.')
   parser.add_argument('--gen-emb-dim', default=768, type=int, metavar='N', help='Embedding dimension for generation.')
+  parser.add_argument('--gen-emb-dim2', default=2048, type=int, metavar='N', help='Embedding dimension for generation.')
 
   parser.add_argument('--min-pixels', default=32*28*28, type=int, metavar='N*28*28', help='Minimum number of pixels for a valid image.')
   parser.add_argument('--max-pixels', default=32*28*28, type=int, metavar='N*28*28', help='Maximum number of pixels for a valid image.')
   
-  text_fc_modes = ['linear', 'gill_mapper']
+  text_fc_modes = ['linear', 'gill_mapper', 'gill_mapper_hunyuan']
   parser.add_argument('--text-fc-mode', default='gill_mapper',
             choices=text_fc_modes, help='What kind of translation mapping to use.')
   parser.add_argument('--ret-text-fc-mode', default='linear',
@@ -245,10 +247,12 @@ def main_worker(gpu, ngpus_per_node, args):
   model_args.n_visual_tokens = args.n_visual_tokens
   model_args.ret_emb_dim = args.ret_emb_dim
   model_args.gen_emb_dim = args.gen_emb_dim
+  model_args.gen_emb_dim2 = args.gen_emb_dim2
   model_args.text_fc_mode = args.text_fc_mode
   model_args.ret_text_fc_mode = args.ret_text_fc_mode
   model_args.num_tokens = args.num_tokens
   model_args.num_clip_tokens = args.num_clip_tokens
+  model_args.num_t5_tokens = args.num_t5_tokens
   model_args.precision = args.precision
   model_args.min_pixels = args.min_pixels
   model_args.max_pixels = args.max_pixels
@@ -377,11 +381,13 @@ def main_worker(gpu, ngpus_per_node, args):
 
   train_loader = torch.utils.data.DataLoader(
     train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-    num_workers=args.workers, pin_memory=True, sampler=train_sampler, collate_fn=data.custom_images_collate_fn)
+    num_workers=args.workers, pin_memory=True, sampler=train_sampler,
+    collate_fn=data.custom_images_collate_fn_hunyuan if args.text_fc_mode == "gill_mapper_hunyuan" else data.custom_images_collate_fn)
 
   val_loader = torch.utils.data.DataLoader(
     val_dataset, batch_size=(args.val_batch_size or args.batch_size), shuffle=False,
-    num_workers=args.workers, pin_memory=True, sampler=val_sampler, collate_fn=data.custom_images_collate_fn)
+    num_workers=args.workers, pin_memory=True, sampler=val_sampler,
+    collate_fn=data.custom_images_collate_fn_hunyuan if args.text_fc_mode == "gill_mapper_hunyuan" else data.custom_images_collate_fn)
 
   if args.evaluate:
     validate.validate(val_loader, model, tokenizer, criterion, epoch, args)
@@ -454,7 +460,11 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
   model.train()
   end = time.time()
 
-  for i, (_, raw_images, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb) in enumerate(train_loader):
+  for i, batch in enumerate(train_loader):
+    if args.text_fc_mode == "gill_mapper_hunyuan":
+      _, raw_images, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb, t5_emb = batch
+    else:
+      _, raw_images, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb = batch
     # images is a list of pixel values of different shapes
     actual_step = epoch * args.steps_per_epoch + i + 1
     # measure data loading time
@@ -469,6 +479,8 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       gen_token_ids = gen_token_ids.cuda(args.gpu, non_blocking=True)
       gen_labels = gen_labels.cuda(args.gpu, non_blocking=True)
       clip_emb = clip_emb.cuda(args.gpu, non_blocking=True)
+      if args.text_fc_mode == "gill_mapper_hunyuan":
+        t5_emb = t5_emb.cuda(args.gpu, non_blocking=True)
 
     if args.precision == 'fp16':
       images = [image.half() for image in images]
@@ -491,8 +503,12 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
       else:
         input_ids, labels, caption_start_id, caption_end_id = cap_token_ids, cap_labels, cap_start_id, cap_end_id  # For captioning, it doesn't matter.
 
-      (model_output, full_labels, last_embedding, _, visual_embs, visual_embs_norm,
-        input_embs_norm, _) = model(images, image_grid_thw, input_ids, labels, caption_start_id, caption_end_id, mode=model_mode)
+      if args.text_fc_mode == "gill_mapper_hunyuan":
+        (model_output, full_labels, last_embedding, last_embedding2, _, visual_embs, visual_embs_norm,
+          input_embs_norm, _) = model(images, image_grid_thw, input_ids, labels, caption_start_id, caption_end_id, mode=model_mode)
+      else:
+        (model_output, full_labels, last_embedding, _, visual_embs, visual_embs_norm,
+          input_embs_norm, _) = model(images, image_grid_thw, input_ids, labels, caption_start_id, caption_end_id, mode=model_mode)
       output = model_output.logits
 
       # Measure captioning accuracy for multi-task models and next-token prediction for retrieval models.
@@ -553,8 +569,13 @@ def train(train_loader, model, tokenizer, criterion, optimizer, epoch, scheduler
           last_embedding = last_embedding.reshape((last_embedding.shape[0], seq_len, -1))
           assert last_embedding.shape == clip_emb.shape, (last_embedding.shape == clip_emb.shape)
 
-        image_loss = losses_utils.l2_loss(clip_emb, last_embedding)  # (N,)
-        gen_loss = args.gen_loss_scale * image_loss.mean()
+        if args.text_fc_mode == "gill_mapper_hunyuan":
+          image_loss = losses_utils.l2_loss(clip_emb, last_embedding)  # (N,)
+          image_loss2 = losses_utils.l2_loss(t5_emb, last_embedding2)  # (N,)
+          gen_loss = args.gen_loss_scale * (image_loss.mean() + image_loss2.mean()) * 0.5
+        else:
+          image_loss = losses_utils.l2_loss(clip_emb, last_embedding)  # (N,)
+          gen_loss = args.gen_loss_scale * image_loss.mean()
         loss += gen_loss
         gen_losses.update(gen_loss.item(), batch_size)
 

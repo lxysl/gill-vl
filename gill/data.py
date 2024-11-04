@@ -41,6 +41,25 @@ def custom_images_collate_fn(batch):
   return image_path, raw_images, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb
 
 
+def custom_images_collate_fn_hunyuan(batch):
+  image_path = [x[0] for x in batch]
+  raw_images = torch.stack([x[1] for x in batch])
+  images = [torch.tensor(x[2]) for x in batch]  # list of pixel values
+  image_grid_thw = torch.stack([torch.tensor(x[3]) for x in batch])
+  cap_img = torch.stack([x[4] for x in batch])
+  captioning_input_ids = torch.stack([x[5] for x in batch])
+  captioning_labels = torch.stack([x[6] for x in batch])
+  captioning_start_id = torch.tensor([x[7] for x in batch])
+  captioning_end_id = torch.tensor([x[8] for x in batch])
+  gen_input_ids = torch.stack([x[9] for x in batch])
+  gen_labels = torch.stack([x[10] for x in batch])
+  gen_start_id = torch.tensor([x[11] for x in batch])
+  gen_end_id = torch.tensor([x[12] for x in batch])
+  clip_emb = torch.stack([torch.tensor(x[13]) for x in batch])
+  t5_emb = torch.stack([torch.tensor(x[14]) for x in batch])
+  return image_path, raw_images, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb, t5_emb
+
+
 def get_dataset(args, split: str, processor, tokenizer, precision: str = 'fp32') -> Dataset:
   assert split in ['train', 'val'
     ], 'Expected split to be one of "train" or "val", got {split} instead.'
@@ -53,7 +72,7 @@ def get_dataset(args, split: str, processor, tokenizer, precision: str = 'fp32')
   # Folder structure should look like:
   if split == 'train':
     if 'cc3m' in args.dataset:
-      dataset_paths.append(os.path.join(args.dataset_dir, 'cc3m_train.tsv'))
+      dataset_paths.append(os.path.join(args.dataset_dir, 'cc3m_train_sampled.tsv'))
       image_data_dirs.append(os.path.join(args.image_dir, 'cc3m/training/'))
     else:
       raise NotImplementedError
@@ -75,13 +94,13 @@ def get_dataset(args, split: str, processor, tokenizer, precision: str = 'fp32')
       CsvDataset(path, image_dir, processor, 'image',
         'caption', None, tokenizer, train=train, max_len=args.max_len, precision=args.precision,
         image_size=args.image_size, retrieval_token_idx=args.retrieval_token_idx, gen_token_idx=args.gen_token_idx, 
-        num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens, input_prompt=args.input_prompt)
+        num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens, num_t5_tokens=args.num_t5_tokens, input_prompt=args.input_prompt, text_fc_mode=args.text_fc_mode)
       for (path, image_dir) in zip(dataset_paths, image_data_dirs)])
   elif len(dataset_paths) == 1:
     dataset = CsvDataset(dataset_paths[0], image_data_dirs[0], processor, 'image',
       'caption', None, tokenizer, train=train, max_len=args.max_len, precision=args.precision,
       image_size=args.image_size, retrieval_token_idx=args.retrieval_token_idx, gen_token_idx=args.gen_token_idx, 
-      num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens, input_prompt=args.input_prompt)
+      num_tokens=args.num_tokens, num_clip_tokens=args.num_clip_tokens, num_t5_tokens=args.num_t5_tokens, input_prompt=args.input_prompt, text_fc_mode=args.text_fc_mode)
   else:
     raise ValueError(f'There should be at least one valid dataset, got train={args.dataset}, val={args.val_dataset} instead.')
   return dataset
@@ -92,7 +111,7 @@ class CsvDataset(Dataset):
                caption_key, feature_extractor_model: str=None, tokenizer=None,
                train: bool = True, max_len: int = 128, sep="\t", precision: str = 'fp32',
                image_size: int = 224, retrieval_token_idx: List[int] = [-1], gen_token_idx: List[int] = [-1],
-               num_tokens: int = 1, num_clip_tokens: int = 1, input_prompt: str = ""):
+               num_tokens: int = 1, num_clip_tokens: int = 1, num_t5_tokens: int = 1, input_prompt: str = "", text_fc_mode: str = 'gill_mapper'):
     logging.debug(f'Loading tsv data from {input_filename}.')
     df = pd.read_csv(input_filename, sep=sep)
 
@@ -111,7 +130,9 @@ class CsvDataset(Dataset):
     self.gen_token_idx = gen_token_idx
     self.num_tokens = num_tokens
     self.num_clip_tokens = num_clip_tokens
+    self.num_t5_tokens = num_t5_tokens
     self.input_prompt = input_prompt
+    self.text_fc_mode = text_fc_mode
 
     self.font = None
 
@@ -123,7 +144,11 @@ class CsvDataset(Dataset):
   def __getitem__(self, idx):
     while True:
       image_path = os.path.join(self.base_image_dir, str(self.images[idx]))
-      clip_l_path = os.path.join(self.base_image_dir, 'clip_embs', str(self.images[idx]) + '.npy')
+      if self.text_fc_mode == 'gill_mapper_hunyuan':
+        clip_l_path = os.path.join(self.base_image_dir, 'hydit_clip_embs', str(self.images[idx]) + '.npy')
+        t5_path = os.path.join(self.base_image_dir, 'hydit_t5_embs', str(self.images[idx]) + '.npy')
+      else:
+        clip_l_path = os.path.join(self.base_image_dir, 'clip_embs', str(self.images[idx]) + '.npy')
       # caption = "A picture of" + caption + [IMG0]...[IMG7]
       caption = str(self.captions[idx])
       caption = self.input_prompt + caption
@@ -155,6 +180,10 @@ class CsvDataset(Dataset):
         with open(clip_l_path, 'rb') as f:
           clip_emb = np.load(f, allow_pickle=True)   # (num_clip_tokens, 768)
           clip_emb = clip_emb[:self.num_clip_tokens, :]
+        if self.text_fc_mode == 'gill_mapper_hunyuan':
+          with open(t5_path, 'rb') as f:
+            t5_emb = np.load(f, allow_pickle=True)   # (num_t5_tokens, 256)
+            t5_emb = t5_emb[:self.num_t5_tokens, :]
 
         labels = self.tokenizer.encode(caption, add_special_tokens=False, return_tensors="pt")[0]
         labels[-self.num_tokens:] = -100
@@ -234,7 +263,10 @@ class CsvDataset(Dataset):
         self.font = self.font or ImageFont.load_default()
         cap_img = utils.create_image_of_text(decode_caption.encode('ascii', 'ignore'), width=self.image_size, nrows=2, font=self.font)
 
-        return image_path, raw_images, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb
+        if self.text_fc_mode == 'gill_mapper_hunyuan':
+          return image_path, raw_images, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb, t5_emb
+        else:
+          return image_path, raw_images, images, image_grid_thw, cap_img, captioning_input_ids, captioning_labels, captioning_start_id, captioning_end_id, gen_input_ids, gen_labels, gen_start_id, gen_end_id, clip_emb
       except Exception as e:
         print(f'Error reading for {image_path} with caption {caption}: {e}')
         traceback.print_exc()

@@ -95,24 +95,48 @@ After preprocessing the data, we can finally start a training job with the follo
 
 ```
 randport=$(shuf -i8000-9999 -n1)  # Generate a random port number
-CUDA_VISIBLE_DEVICES=1 python -u main.py \
+CUDA_VISIBLE_DEVICES=2 python -u main.py \
     --dist-url "tcp://127.0.0.1:${randport}" --dist-backend 'nccl' \
     --multiprocessing-distributed --world-size 1 --rank 0 \
     --vlm-version='Qwen/Qwen2-VL-2B-Instruct' \
     --dataset=cc3m  --val-dataset=cc3m \
     --exp-name='gill_exp' --image-dir='/home/lxy/Downloads'  --log-base-dir='runs/' \
-    --precision='bf16'  --print-freq=100  --batch-size=12  --val-batch-size=8  --val_steps_per_epoch=1  --epochs=10  --steps_per_epoch=20000
+    --precision='bf16'  --print-freq=100  --batch-size=12  --val-batch-size=8  --val_steps_per_epoch=1  --epochs=10  --steps_per_epoch=20000  --lr-warmup-steps=20000
+```
+
+```
+randport=$(shuf -i8000-9999 -n1)  # Generate a random port number
+CUDA_VISIBLE_DEVICES=2 python -u main.py \
+    --dist-url "tcp://127.0.0.1:${randport}" --dist-backend 'nccl' \
+    --multiprocessing-distributed --world-size 1 --rank 0 \
+    --vlm-version='Qwen/Qwen2-VL-2B-Instruct' \
+    --dataset=cc3m  --val-dataset=cc3m \
+    --exp-name='gill_vl_hunyuan_exp' --image-dir='/home/lxy/Downloads'  --log-base-dir='runs/' \
+    --precision='bf16'  --print-freq=100  --batch-size=8  --val-batch-size=8  --val_steps_per_epoch=1  --epochs=10  --lr-warmup-steps=1600 \
+    --gen-emb-dim=1024   --gen-emb-dim2=2048 \
+    --text-fc-mode='gill_mapper_hunyuan'
 ```
 The default hyperparameters in `main.py` should reproduce our main results in the paper. We train on 2 A6000 GPUs for 48 hours. For GPUs with smaller memory available, you might need to reduce the batch size, enable gradient accumulation, or adjust hyperparameters to get good performance. You may also have to disable NCCL P2P with export NCCL_P2P_DISABLE=1 if you run into issues.
 
 You can also run a small job on CPU, for testing purposes:
 ```
-CUDA_VISIBLE_DEVICES=0 python -u main.py \
+CUDA_VISIBLE_DEVICES=2 python -u main.py \
     --dataset=cc3m  --val-dataset=cc3m \
     --vlm-version='Qwen/Qwen2-VL-2B-Instruct' \
-    --exp-name='gill_exp'   --log-base-dir='runs/' \
+    --exp-name='gill_vl_exp'   --log-base-dir='runs/' \
     --batch-size=2  --val-batch-size=2  --precision='fp32'  --print-freq=1 \
     --epochs=2  --val_steps_per_epoch=2   --steps_per_epoch=2   --image-dir '/home/lxy/Downloads'
+```
+
+```
+CUDA_VISIBLE_DEVICES=2 python -u main.py \
+    --dataset=cc3m  --val-dataset=cc3m \
+    --vlm-version='Qwen/Qwen2-VL-2B-Instruct' \
+    --exp-name='gill_vl_hunyuan_exp'   --log-base-dir='runs/' \
+    --batch-size=2  --val-batch-size=2  --precision='fp32'  --print-freq=1 \
+    --epochs=2  --val_steps_per_epoch=2   --steps_per_epoch=2   --image-dir '/home/lxy/Downloads' \
+    --gen-emb-dim=1024   --gen-emb-dim2=2048 \
+    --text-fc-mode='gill_mapper_hunyuan'
 ```
 
 ## Pruning the Checkpoint
