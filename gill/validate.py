@@ -48,8 +48,8 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
       all_text_features = []
 
       for i, batch in tqdm.tqdm(enumerate(loader), position=0, total=len(loader)):
-        if args.text_fc_mode == "gill_mapper_hunyuan":
-          image_paths, raw_images, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb, t5_emb = batch
+        if args.text_fc_mode in ["gill_mapper_hunyuan", "gill_mapper_kolors"]:
+          image_paths, raw_images, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb, emb_2 = batch
         else:
           image_paths, raw_images, images, image_grid_thw, caption_images, cap_token_ids, cap_labels, cap_start_id, cap_end_id, gen_token_ids, gen_labels, gen_start_id, gen_end_id, clip_emb = batch
         # images is a list of pixel values of different shapes
@@ -64,8 +64,8 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
           images = [image.cuda(args.gpu) for image in images]
           image_grid_thw = image_grid_thw.cuda(args.gpu, non_blocking=True)
           clip_emb = clip_emb.cuda(args.gpu, non_blocking=True)
-          if args.text_fc_mode == "gill_mapper_hunyuan":
-            t5_emb = t5_emb.cuda(args.gpu, non_blocking=True)
+          if args.text_fc_mode in ["gill_mapper_hunyuan", "gill_mapper_kolors"]:
+            emb_2 = emb_2.cuda(args.gpu, non_blocking=True)
 
         if args.precision == 'fp16':
           images = [image.half() for image in images]
@@ -81,7 +81,7 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
           else:
             input_ids, labels, caption_start_id, caption_end_id = cap_token_ids, cap_labels, cap_start_id, cap_end_id  # For captioning, it doesn't matter.
 
-          if args.text_fc_mode == "gill_mapper_hunyuan":
+          if args.text_fc_mode in ["gill_mapper_hunyuan", "gill_mapper_kolors"]:
             (model_output, full_labels, last_embedding, last_embedding2, _, visual_embs, visual_embs_norm,
               input_embs_norm, _) = model(images, image_grid_thw, input_ids, labels, caption_start_id, caption_end_id, mode=model_mode)
           else:
@@ -128,9 +128,9 @@ def validate(val_loader, model, tokenizer, criterion, epoch, args):
               seq_len = clip_emb.shape[1]
               last_embedding = last_embedding.reshape((last_embedding.shape[0], seq_len, -1))
               assert last_embedding.shape == clip_emb.shape, (last_embedding.shape == clip_emb.shape)
-            if args.text_fc_mode == "gill_mapper_hunyuan":
+            if args.text_fc_mode in ["gill_mapper_hunyuan", "gill_mapper_kolors"]:
               image_loss = losses_utils.l2_loss(clip_emb, last_embedding)  # (N,)
-              image_loss2 = losses_utils.l2_loss(t5_emb, last_embedding2)  # (N,)
+              image_loss2 = losses_utils.l2_loss(emb_2, last_embedding2)  # (N,)
               gen_loss = args.gen_loss_scale * (image_loss.mean() + image_loss2.mean()) * 0.5
             else:
               image_loss = losses_utils.l2_loss(clip_emb, last_embedding)  # (N,)

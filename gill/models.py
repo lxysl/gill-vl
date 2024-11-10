@@ -1,6 +1,6 @@
 from typing import List, Dict, Optional, Union
 from collections import namedtuple
-from diffusers import StableDiffusionPipeline, HunyuanDiTPipeline
+from diffusers import StableDiffusionPipeline, HunyuanDiTPipeline, KolorsPipeline
 import json
 import numpy as np
 import os
@@ -53,8 +53,8 @@ class GILLModel(nn.Module):
     self.num_clip_tokens = args.num_clip_tokens
 
     vlm_version = args.vlm_version
-    n_visual_tokens = args.n_visual_tokens
-    print(f"Using {vlm_version} for the language model with {n_visual_tokens} visual tokens.")
+    # n_visual_tokens = args.n_visual_tokens
+    print(f"Using {vlm_version} for the language model with dynamic number of visual tokens.")  # Qwen2VL
 
     if args.precision == 'fp16':
       precision = torch.float16
@@ -68,7 +68,7 @@ class GILLModel(nn.Module):
     print("Restoring pretrained weights for the vision language model.")
     if 'Qwen2' in vlm_version:
       self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
-        vlm_version, torch_dtype=precision, device_map="auto"
+        vlm_version, torch_dtype=precision, device_map="cuda"
       )
       self.lm = self.vlm.model
       self.visual_model = self.vlm.visual
@@ -109,7 +109,7 @@ class GILLModel(nn.Module):
     for layer_idx in self.args.text_emb_layers:
       if (layer_idx == -1 or layer_idx == self.lm.config.num_hidden_layers):
         if 'Qwen2' in self.vlm_version:  # Qwen2 models
-          in_dim = self.lm.config.hidden_size
+          in_dim = self.lm.config.hidden_size  # 1536
         else:
           raise NotImplementedError
 
@@ -119,7 +119,14 @@ class GILLModel(nn.Module):
                               num_output_tokens=1, mode=self.args.ret_text_fc_mode))
           self.gen_text_hidden_fcs.append(
             layers.TextFcLayer(in_dim, self.args.gen_emb_dim, out_dim2=2048, num_input_tokens=self.args.num_tokens,
-                              num_output_tokens=self.args.num_clip_tokens+self.args.num_t5_tokens, mode=self.args.text_fc_mode))
+                              num_output_tokens=self.args.num_clip_tokens+self.args.num_emb2_tokens, mode=self.args.text_fc_mode))
+        elif self.args.text_fc_mode == 'gill_mapper_kolors':
+          self.ret_text_hidden_fcs.append(
+            layers.TextFcLayer(in_dim, self.args.ret_emb_dim, out_dim2=None, num_input_tokens=self.args.num_tokens,
+                              num_output_tokens=1, mode=self.args.ret_text_fc_mode))
+          self.gen_text_hidden_fcs.append(
+            layers.TextFcLayer(in_dim, self.args.gen_emb_dim, out_dim2=4096, num_input_tokens=self.args.num_tokens,
+                              num_output_tokens=self.args.num_clip_tokens+self.args.num_emb2_tokens, mode=self.args.text_fc_mode))
         else:
           self.ret_text_hidden_fcs.append(
             layers.TextFcLayer(in_dim, self.args.ret_emb_dim, out_dim2=None, num_input_tokens=self.args.num_tokens,
@@ -273,7 +280,7 @@ class GILLModel(nn.Module):
         input_embedding = torch.stack([input_embs[i, caption_end_id[i]:caption_end_id[i]+self.num_tokens, :] for i in range(batch_size)], axis=0)
         llm_hidden_states.append(input_hidden_state)
         mapped_hidden_states = fc_layer(input_hidden_state, input_embedding)
-        if mode == 'generation' and self.args.text_fc_mode == 'gill_mapper_hunyuan':
+        if mode == 'generation' and self.args.text_fc_mode in ['gill_mapper_hunyuan', 'gill_mapper_kolors']:
           hidden_states.append(mapped_hidden_states[0])
           hidden_states2.append(mapped_hidden_states[1])
         else:
@@ -281,7 +288,7 @@ class GILLModel(nn.Module):
 
       # Add hidden states together.
       last_embedding = torch.stack(hidden_states, dim=-1).sum(dim=-1) #torch.stack([last_hidden_state[i, :, :] for i in range(batch_size)], axis=0)  # (N, T, D)
-      if mode == 'generation' and self.args.text_fc_mode == 'gill_mapper_hunyuan':
+      if mode == 'generation' and self.args.text_fc_mode in ['gill_mapper_hunyuan', 'gill_mapper_kolors']:
         last_embedding2 = torch.stack(hidden_states2, dim=-1).sum(dim=-1)
       last_output_logit = torch.stack([output.logits[i, -1, :] for i in range(batch_size)], axis=0)  # (N, D)
 
@@ -302,7 +309,7 @@ class GILLModel(nn.Module):
     else:
       raise NotImplementedError
 
-    if self.args.text_fc_mode == 'gill_mapper_hunyuan':
+    if self.args.text_fc_mode in ['gill_mapper_hunyuan', 'gill_mapper_kolors']:
       return output, labels, last_embedding, last_embedding2, last_output_logit, visual_embs, visual_embs_norm, input_embs_norm, llm_hidden_states
     else:
       return output, labels, last_embedding, last_output_logit, visual_embs, visual_embs_norm, input_embs_norm, llm_hidden_states
@@ -416,6 +423,7 @@ class GILL(nn.Module):
     self.idx2dec = {0: 'gen', 1: 'ret', 2: 'same'}
     self.decision_model = None
     self.sd = None
+    self.text_fc_mode = model_args.text_fc_mode
 
     # Load the Stable Diffusion model.
     if load_sd:
@@ -423,6 +431,10 @@ class GILL(nn.Module):
         model_id = "Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled"
         self.sd_pipe = HunyuanDiTPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
         self.sd = "hunyuan"
+      elif model_args.text_fc_mode == "gill_mapper_kolors":
+        model_id = "Kwai-Kolors/Kolors-diffusers"
+        self.sd_pipe = KolorsPipeline.from_pretrained(model_id, torch_dtype=torch.float16, variant="fp16").to("cuda:1")
+        self.sd = "kolors"
       else:
         model_id = "runwayml/stable-diffusion-v1-5"
         self.sd_pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
@@ -575,10 +587,12 @@ class GILL(nn.Module):
           gen_prefx_ids = self.model.tokenizer(gen_prefix, add_special_tokens=False, return_tensors="pt").input_ids.to(self.model.logit_scale.device)
           gen_prefix_embs = self.model.input_embeddings(gen_prefx_ids)  # (1, T, D)
           gen_emb = self.model.gen_text_hidden_fcs[0](raw_emb, gen_prefix_embs)  # (1, 77, 768)
-          if self.args.text_fc_mode == "gill_mapper_hunyuan":
+          if self.text_fc_mode in ["gill_mapper_hunyuan", "gill_mapper_kolors"]:
             gen_emb, gen_emb2 = gen_emb
+            np.save('gen_emb.npy', gen_emb.float().cpu().numpy())
+            np.save('gen_emb2.npy', gen_emb2.float().cpu().numpy())
 
-          if gen_emb.shape[1] != 77:
+          if self.text_fc_mode not in ["gill_mapper_hunyuan", "gill_mapper_kolors"] and gen_emb.shape[1] != 77:
             print(f"Padding {gen_emb.shape} with zeros")
             bs = gen_emb.shape[0]
             clip_emb = 768
@@ -588,8 +602,9 @@ class GILL(nn.Module):
             print('Padded to', gen_emb.shape)
 
           gen_emb = gen_emb.repeat(self.num_gen_images, 1, 1)  # (self.num_gen_images, 77, 768)
-          if self.args.text_fc_mode == "gill_mapper_hunyuan":
-            gen_emb2 = gen_emb2.repeat(self.num_gen_images, 1, 1)  # (self.num_gen_images, 77, 768)
+          if self.text_fc_mode in ["gill_mapper_hunyuan", "gill_mapper_kolors"]:
+            # gen_emb is (self.num_gen_images, 77, 1024), (self.num_gen_images, 256, 4096)
+            gen_emb2 = gen_emb2.repeat(self.num_gen_images, 1, 1)  # (self.num_gen_images, 256, 2048), (self.num_gen_images, 1, 4096)
 
           # OPTIM(jykoh): Only generate if scores are low.
           if self.load_sd:
@@ -599,12 +614,44 @@ class GILL(nn.Module):
             for i in range(0, self.num_gen_images, gen_max_bs):
               if self.sd == "hunyuan":
                 gen_images.extend(
-                  self.sd_pipe(prompt_embeds=gen_emb[i:i+gen_max_bs], prompt_embeds_2=gen_emb2[i:i+gen_max_bs], generator=generator,
-                             guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images)
+                  self.sd_pipe(prompt_embeds=gen_emb[i:i+gen_max_bs],
+                               prompt_embeds_2=gen_emb2[i:i+gen_max_bs],
+                               prompt_attention_mask=torch.ones_like(gen_emb[i:i+gen_max_bs][:, :, 0]),
+                               prompt_attention_mask_2=torch.ones_like(gen_emb2[i:i+gen_max_bs][:, :, 0]),
+                               generator=generator,
+                               guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images)
+              elif self.sd == "kolors":
+                gen_images.extend(
+                  self.sd_pipe(prompt_embeds=gen_emb[i:i+gen_max_bs].to(self.sd_pipe.device, dtype=self.sd_pipe.dtype),
+                               pooled_prompt_embeds=gen_emb2[i:i+gen_max_bs, 0, :].to(self.sd_pipe.device, dtype=self.sd_pipe.dtype),
+                               generator=generator,
+                               guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images)
+
+                # gen_emb = torch.from_numpy(np.load('/home/lxy/Downloads/cc3m/training/kolors_embs/000979440.jpg.npy'))
+                # gen_emb2 = torch.from_numpy(np.load('/home/lxy/Downloads/cc3m/training/kolors_pooled_embs/000979440.jpg.npy'))
+                # # 为 gen_emb 和 gen_emb2 添加高斯噪声
+                # noise_emb = torch.normal(mean=0, std=1, size=gen_emb.shape)
+                # noise_emb2 = torch.normal(mean=0, std=1, size=gen_emb2.shape)
+                # gen_emb = gen_emb + noise_emb
+                # gen_emb2 = gen_emb2 + noise_emb2
+                # # 随机修改 gen_emb 和 gen_emb2 的值
+                # shape, shape2 = gen_emb.shape, gen_emb2.shape
+                # import random
+                # for _ in range(100):
+                #   random_index = torch.randint(0, gen_emb.numel(), (1,))
+                #   gen_emb.view(-1)[random_index] += random.randint(-100, 100)
+                #   random_index = torch.randint(0, gen_emb2.numel(), (1,))
+                #   gen_emb2.view(-1)[random_index] += random.randint(-100, 100)
+                # gen_emb, gen_emb2 = gen_emb.reshape(shape), gen_emb2.reshape(shape2)
+                # gen_images.extend(
+                #   self.sd_pipe(prompt_embeds=gen_emb.unsqueeze(0).to(self.sd_pipe.device, dtype=self.sd_pipe.dtype),
+                #                pooled_prompt_embeds=gen_emb2.unsqueeze(0).to(self.sd_pipe.device, dtype=self.sd_pipe.dtype),
+                #                generator=generator,
+                #                guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images)
               else:
                 gen_images.extend(
                   self.sd_pipe(prompt_embeds=gen_emb[i:i+gen_max_bs], generator=generator,
-                             guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images)
+                               guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images)
             
             if self.emb_matrix is not None:
               all_gen_pixels = []
